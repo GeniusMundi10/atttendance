@@ -6,6 +6,8 @@ import { SecondFactor } from './SecondFactor'
 
 type Employee = {employeeId:string, displayName:string}
 type Receipt = {punchId:string, action:'IN'|'OUT', recordedAt:string}
+type EffectiveTime = {recordedAt:string,source:'PUNCH'|'APPROVED_CORRECTION',punchId?:string,correctionDayId?:string}
+type EffectiveDay = {date:string,in:EffectiveTime|null,out:EffectiveTime|null}
 const time = new Intl.DateTimeFormat('en-IN',{dateStyle:'medium',timeStyle:'medium',timeZone:'Asia/Kolkata'})
 async function load<T>(path:string, token:string, signal:AbortSignal):Promise<T> {
   const res = await fetch(path,{signal,cache:'no-store',headers:{Authorization:'Bearer '+token}})
@@ -24,6 +26,7 @@ export function ReceiptPortal() {
   const [roster,setRoster] = useState<Employee[]>([])
   const [selected,setSelected] = useState('')
   const [receipts,setReceipts] = useState<Receipt[]|null>(null)
+  const [days,setDays] = useState<EffectiveDay[]|null>(null)
   const [reload,setReload] = useState(0)
   const [sending,setSending] = useState(false)
   const [offset,setOffset] = useState(0)
@@ -37,7 +40,7 @@ export function ReceiptPortal() {
   },[])
   const token=session?.access_token
   useEffect(()=>{
-    setRoster([]); setSelected(''); setReceipts(null)
+    setRoster([]); setSelected(''); setReceipts(null); setDays(null)
     if (!token) return
     const ctl=new AbortController()
     load<{employees:Employee[]}>('/api/employees?offset='+offset,token,ctl.signal)
@@ -46,16 +49,16 @@ export function ReceiptPortal() {
     return ()=>ctl.abort()
   },[token,reload,offset])
   useEffect(()=>{
-    setReceipts(null)
+    setReceipts(null); setDays(null)
     if (!selected || !token) return
     const ctl=new AbortController()
     let timer:ReturnType<typeof setTimeout>
     async function refresh() {
       try {
-        const data=await load<{punches:Receipt[]}>('/api/employees/'+selected+'/punches',token!,ctl.signal)
-        if (!ctl.signal.aborted) {setReceipts(data.punches);setMessage('')}
+        const data=await load<{punches:Receipt[],days:EffectiveDay[]}>('/api/employees/'+selected+'/punches',token!,ctl.signal)
+        if (!ctl.signal.aborted) {setReceipts(data.punches);setDays(data.days);setMessage('')}
       } catch(e) {
-        if (!ctl.signal.aborted) {setReceipts(null);setMessage(e instanceof Error?e.message:'Could not load receipts.')}
+        if (!ctl.signal.aborted) {setReceipts(null);setDays(null);setMessage(e instanceof Error?e.message:'Could not load receipts.')}
       } finally { if (!ctl.signal.aborted) timer=setTimeout(refresh,3000) }
     }
     void refresh()
@@ -72,10 +75,13 @@ export function ReceiptPortal() {
   }
   if (!session) return <section><h1>Sign in</h1><form onSubmit={signIn}><label htmlFor="email">Work email</label><input id="email" type="email" autoComplete="email" required value={email} onChange={e=>setEmail(e.target.value)}/><button disabled={!auth || sending}>{sending?'Sending…':'Email sign-in link'}</button></form><p role="status">{message}</p></section>
   if (auth && message==='mfa_required') return <><SecondFactor auth={auth} onVerified={()=>setReload(r=>r+1)}/><button className="secondary" onClick={()=>void auth.auth.signOut()}>Sign out</button></>
+  const showTime=(value:EffectiveTime|null)=>value?<>{time.format(new Date(value.recordedAt))}<span className="tag">{value.source==='PUNCH'?'Kiosk punch':'Approved correction'}</span></>:'—'
   return <section><header><h1>Attendance</h1><button className="secondary" onClick={()=>void auth?.auth.signOut()}>Sign out</button></header>
     <div className="controls"><label>Employee<select value={selected} onChange={e=>{setReceipts(null);setSelected(e.target.value)}}>{roster.map(e=><option key={e.employeeId} value={e.employeeId}>{e.displayName}</option>)}</select></label><button className="secondary" onClick={()=>setReload(r=>r+1)}>Refresh</button></div>
     {(offset>0 || roster.length===100) && <nav className="controls" aria-label="Employee pages"><button disabled={offset===0} onClick={()=>setOffset(o=>Math.max(0,o-100))}>Previous employees</button><button disabled={roster.length<100} onClick={()=>setOffset(o=>o+100)}>More employees</button></nav>}
-    <h2>Recent punches</h2><p role="status">{message}</p>
+    <h2>Effective days</h2><p>Approved corrections replace the shown day time. Original kiosk receipts remain below.</p>
+    {days?.length ? <table><thead><tr><th>IST date</th><th>In</th><th>Out</th></tr></thead><tbody>{days.map(day=><tr key={day.date}><td>{day.date}</td><td>{showTime(day.in)}</td><td>{showTime(day.out)}</td></tr>)}</tbody></table> : <p>{days?'No attendance days yet.':''}</p>}
+    <h2>Original kiosk receipts</h2><p role="status">{message}</p>
     {receipts?.length ? <table><thead><tr><th>Action</th><th>Time (IST)</th><th>Receipt</th></tr></thead><tbody>{receipts.map(p=><tr key={p.punchId}><td>{p.action==='IN'?'Check in':'Check out'}</td><td>{time.format(new Date(p.recordedAt))}</td><td className="ref">{p.punchId}</td></tr>)}</tbody></table> : <p>{receipts?'No punches recorded.':message?'':selected?'Loading punches…':'Loading employees…'}</p>}
   </section>
 }

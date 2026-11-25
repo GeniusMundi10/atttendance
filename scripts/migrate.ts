@@ -10,7 +10,7 @@ export async function migrate(pool: Pool, root = resolve('features')) {
   return transaction(async client => {
     await client.query("SELECT pg_advisory_xact_lock(hashtext('elt_schema_migrations'))")
     await client.query('CREATE TABLE IF NOT EXISTS elt_schema_migrations (name text PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())')
-    for (const feature of ['access', 'biometrics', 'attendance']) {
+    for (const feature of ['access', 'biometrics', 'attendance', 'corrections']) {
       const dir = join(root,feature,'migrations')
       const files = (await readdir(dir)).filter(file => file.endsWith('.sql')).sort()
       if (!files.length) throw new Error('Missing migrations for ' + feature)
@@ -36,7 +36,8 @@ export async function migrate(pool: Pool, root = resolve('features')) {
         FOREACH t IN ARRAY ARRAY['elt_schema_migrations','access_employees','access_sites',
           'access_employee_sites','access_subject_links','access_operator_roles','access_manager_reports',
           'kiosk_biometric_devices','kiosk_biometric_requests','kiosk_biometric_challenges',
-          'kiosk_face_templates','kiosk_face_enrollment_codes','attendance_punches','attendance_audit','attendance_outbox']
+          'kiosk_face_templates','kiosk_face_enrollment_codes','attendance_punches','attendance_audit','attendance_outbox',
+          'correction_requests','correction_days']
         LOOP
           EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
           EXECUTE format('REVOKE ALL ON TABLE %I FROM PUBLIC', t);

@@ -12,7 +12,7 @@
     "start": "next start apps/web",
     "typecheck": "tsc --noEmit",
     "migrate": "node --experimental-strip-types scripts/migrate.ts",
-    "test:integration": "node --experimental-strip-types --test tests/kiosk.test.ts",
+    "test:integration": "node --experimental-strip-types --test tests/kiosk.test.ts tests/corrections.test.ts",
     "test:features": "node --experimental-strip-types scripts/test-features.ts",
     "test:portal": "node --test tests/portal.test.mjs",
     "check": "npm run typecheck && npm run test:features && npm run test:integration && npm run build && npm run test:portal"
