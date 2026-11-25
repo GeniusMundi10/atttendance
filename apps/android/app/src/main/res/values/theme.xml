@@ -1,0 +1,10 @@
+<!-- PURPOSE: Give the company kiosk the ELT portal's colors and a legible neutral background. -->
+<resources>
+    <style name="EltKiosk" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:colorAccent">#FF7A03</item>
+        <item name="android:windowBackground">#F7F5F0</item>
+        <item name="android:textColorPrimary">#191816</item>
+        <item name="android:colorButtonNormal">#EAE6DE</item>
+        <item name="android:statusBarColor">#191816</item>
+    </style>
+</resources>

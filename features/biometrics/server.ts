@@ -167,7 +167,7 @@ export async function fetchRoster(tx: Db, input: unknown, header: unknown) {
   await useProof(tx, deviceId, signed);
   const key = templateKey();
   const { rows } = await tx.query(`
-    SELECT template.template_id, template.employee_id, template.sealed_embedding
+    SELECT template.template_id, template.employee_id, employee.display_name, template.sealed_embedding
     FROM kiosk_face_templates template ${activeEnrollment}
     WHERE template.site_id = $1
     ORDER BY template.employee_id
@@ -175,6 +175,7 @@ export async function fetchRoster(tx: Db, input: unknown, header: unknown) {
   return {
     templates: rows.map(row => ({
       employeeId: row.employee_id as string,
+      displayName: row.display_name as string,
       templateId: row.template_id as string,
       embedding: decryptEmbedding(row.sealed_embedding as string, `${device.siteId}/${row.employee_id}/${row.template_id}`, key),
     })),

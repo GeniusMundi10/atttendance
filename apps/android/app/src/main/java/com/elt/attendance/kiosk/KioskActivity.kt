@@ -89,6 +89,10 @@ internal class KioskActivity : ComponentActivity() {
             play = PlayProof(applicationContext, config.cloudProject)
             api = KioskApi(config, signer, play)
             val saved = pendingStore.read()
+            if (saved == null && config.mode == Mode.KIOSK) {
+                // A failed warm-up can be retried when an employee starts a punch.
+                runCatching { play.prepare(); api.roster() }
+            }
             onScreen {
                 pending = saved
                 usable = true
@@ -311,7 +315,7 @@ internal class KioskActivity : ComponentActivity() {
             when (purpose) {
                 is CapturePurpose.Punch -> {
                     val body = api.preparePunch(purpose.action, purpose.challenge, checkNotNull(result.template), result.frames)
-                    val saved = PendingPunch(config.origin, config.deviceId, body)
+                    val saved = PendingPunch(config.origin, config.deviceId, body, checkNotNull(result.template).displayName)
                     pendingStore.write(saved)
                     deliver(saved)
                 }
@@ -352,7 +356,13 @@ internal class KioskActivity : ComponentActivity() {
         onScreen {
             pending = null
             startCamera()
-            finishFlow("${receipt.action} recorded at ${receipt.recordedAt} UTC")
+            val action = if (receipt.action == Action.IN) "Check-in" else "Check-out"
+            val time = java.time.format.DateTimeFormatter.ofPattern("d MMM, h:mm:ss a", java.util.Locale.ENGLISH)
+                .withZone(java.time.ZoneId.of("Asia/Kolkata")).format(receipt.recordedAt)
+            val name = saved.displayName.takeIf { it.isNotBlank() }?.let { "$it · " }.orEmpty()
+            finishFlow("$name$action recorded at $time IST")
+            val receiptFlow = flow
+            main.postDelayed({ if (flow == receiptFlow && !busy) message("Select IN or OUT to begin.") }, 4000)
         }
     }
 

@@ -14,7 +14,7 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-internal data class PendingPunch(val origin: String, val deviceId: String, val body: String)
+internal data class PendingPunch(val origin: String, val deviceId: String, val body: String, val displayName: String = "")
 
 internal class PendingStore(context: Context) {
     private val file = AtomicFile(File(context.noBackupFilesDir, "elt-pending-punch"))
@@ -43,12 +43,13 @@ internal class PendingStore(context: Context) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, key(false), GCMParameterSpec(128, bytes, 0, 12))
         val saved = JSONObject(cipher.doFinal(bytes, 12, bytes.size - 12).toString(Charsets.UTF_8))
-        return PendingPunch(saved.getString("origin"), saved.getString("deviceId"), saved.getString("body"))
+        return PendingPunch(saved.getString("origin"), saved.getString("deviceId"), saved.getString("body"), saved.optString("displayName"))
     }
 
     fun write(punch: PendingPunch) {
         check(read() == null)
         val payload = JSONObject().put("origin", punch.origin).put("deviceId", punch.deviceId).put("body", punch.body)
+            .put("displayName", punch.displayName)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, key(true))
         check(cipher.iv.size == 12)

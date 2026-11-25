@@ -112,15 +112,20 @@ internal class PlayProof(context: Context, private val cloudProject: Long) {
 }
 
 internal data class Challenge(val challengeId: String, val nonce: String, val expiresAt: Instant)
-internal data class Template(val employeeId: String, val templateId: String, val feature: FloatArray)
+internal data class Template(val employeeId: String, val templateId: String, val feature: FloatArray, val displayName: String)
 internal data class Receipt(val action: Action, val recordedAt: Instant)
 internal class ApiRejected(val code: String) : IOException("Kiosk request rejected")
 
 internal class KioskApi(private val config: KioskConfig, private val signer: DeviceSigner, private val play: PlayProof) {
+    private var cachedRoster: List<Template> = emptyList()
+    private var rosterUntil = 0L
+
     fun roster(): List<Template> {
+        // This class is called on the serialized network executor. The server rechecks site and template on every punch.
+        if (android.os.SystemClock.elapsedRealtime() < rosterUntil && cachedRoster.isNotEmpty()) return cachedRoster
         val result = post("roster", JSONObject().put("deviceId", config.deviceId), proof("elt-roster-v1"))
         val templates = result.getJSONArray("templates")
-        return List(templates.length()) { index ->
+        val roster = List(templates.length()) { index ->
             val item = templates.getJSONObject(index)
             val employee = item.getString("employeeId").also { require(uuidPattern.matches(it)) }
             val template = item.getString("templateId").also { require(uuidPattern.matches(it)) }
@@ -128,8 +133,11 @@ internal class KioskApi(private val config: KioskConfig, private val signer: Dev
             require(embedding.length() == 128)
             val feature = FloatArray(128) { embedding.getInt(it).also { value -> require(value in -10000..10000) } / 10000f }
             require(kotlin.math.abs(feature.sumOf { it.toDouble() * it } - 1.0) < .003)
-            Template(employee, template, feature)
+            Template(employee, template, feature, item.optString("displayName").take(100))
         }
+        cachedRoster = roster
+        rosterUntil = android.os.SystemClock.elapsedRealtime() + 30_000L
+        return roster
     }
 
     fun challenge(action: Action): Challenge {
@@ -203,19 +211,29 @@ internal class KioskApi(private val config: KioskConfig, private val signer: Dev
             connection.outputStream.use { it.write(bytes) }
             val status = connection.responseCode
             if (status in 400..499) {
-                val error = connection.errorStream?.use { it.readNBytes(8192).toString(Charsets.UTF_8) }
+                val error = connection.errorStream?.use { readBounded(it, 8192).toString(Charsets.UTF_8) }
                 val code = error?.let { runCatching { JSONObject(it).getString("error") }.getOrNull() }
                 // Only a definitive application-level rejection can retire an unresolved request.
-                if (code != null && code.matches(Regex("[A-Z][A-Z0-9_]{2,80}"))) throw ApiRejected(code)
+                if (code != null && code.matches(Regex("[A-Za-z][A-Za-z0-9_]{2,80}"))) throw ApiRejected(code)
                 throw IOException("Kiosk server response was incomplete")
             }
             if (status !in 200..299) throw IOException("Kiosk server unavailable")
             val limit = if (endpoint == "roster") 4 * 1024 * 1024 else 32768
-            val response = connection.inputStream.use { it.readNBytes(limit + 1) }
-            if (response.size > limit) throw IOException("Kiosk server response exceeded limit")
+            val response = connection.inputStream.use { readBounded(it, limit) }
             return JSONObject(response.toString(Charsets.UTF_8))
         } finally {
             connection.disconnect()
+        }
+    }
+
+    private fun readBounded(input: java.io.InputStream, limit: Int): ByteArray {
+        val output = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(4096)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) return output.toByteArray()
+            if (output.size() + count > limit) throw IOException("Kiosk server response exceeded limit")
+            output.write(buffer, 0, count)
         }
     }
 }
