@@ -21,7 +21,8 @@ test('monthly paid day is reserved once and only scoped actors decide it',{
     await Promise.all(clients.map(c=>c.query(`SET search_path TO "${schema}"`)))
     const accessSql=await readFile(fileURLToPath(new URL('../access/migrations/001_access.sql',import.meta.url)),'utf8')
     const leaveSql=await readFile(fileURLToPath(new URL('./migrations/001_paid_leave.sql',import.meta.url)),'utf8')
-    await a.query(accessSql);await a.query(leaveSql)
+    const scheduleSql=await readFile(fileURLToPath(new URL('../schedule/migrations/001_schedule.sql',import.meta.url)),'utf8')
+    await a.query(accessSql);await a.query(leaveSql);await a.query(scheduleSql)
     const today=(await a.query("SELECT to_char((now() AT TIME ZONE 'Asia/Kolkata')::date,'YYYY-MM-DD') AS d")).rows[0].d as string
     const next=new Date(Date.parse(today+'T00:00:00Z')+86400000).toISOString().slice(0,10)
     if (next.slice(0,7)!==today.slice(0,7)) {t.skip('No future date remains in current month');return}

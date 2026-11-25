@@ -4,6 +4,8 @@ import { AttendanceActionOrderError, AttendanceConflictError, listPunchReceipts 
 import { BiometricsError, enrollFace, fetchRoster, issueChallenge } from '../features/biometrics/server.ts'
 import { CorrectionError, listEffectiveDays } from '../features/corrections/corrections.ts'
 import { correctionsApi } from '../features/corrections/http.ts'
+import { scheduleApi } from '../features/schedule/http.ts'
+import { ScheduleError } from '../features/schedule/schedule.ts'
 import { portalIdentity } from './auth.ts'
 import { transaction } from './db.ts'
 import { HttpError, body, json, uuid } from './http.ts'
@@ -11,6 +13,7 @@ import { submitPunch } from './kiosk.ts'
 
 async function dispatch(request:Request, parts:string[]) {
   if (parts[0] === 'corrections') return correctionsApi(request, parts.slice(1))
+  if (parts[0] === 'schedule') return scheduleApi(request, parts.slice(1))
   if (request.method === 'POST' && parts.length === 2 && parts[0] === 'kiosk') {
     const data = await body(request)
     const proof = request.headers.get('x-kiosk-proof')
@@ -46,6 +49,7 @@ export async function api(request:Request, parts:string[]) {
     if (err instanceof AttendanceActionOrderError) return json({error:err.code,expectedAction:err.expectedAction},409)
     if (err instanceof AttendanceConflictError) return json({error:err.code},409)
     if (err instanceof CorrectionError) return json({error:err.code},err.status)
+    if (err instanceof ScheduleError) return json({error:err.code},err.status)
     // Report only a diagnostic identifier; database errors may contain personal data.
     const incident=crypto.randomUUID()
     console.error('Attendance request failed',incident,err instanceof Error?err.name:'Error')

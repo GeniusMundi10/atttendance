@@ -1,6 +1,7 @@
 // PURPOSE: Reserve one monthly paid day and decide requests with locked PostgreSQL balances.
 import { randomUUID } from 'node:crypto'
 import { AccessDeniedError, resolveAuthenticatedSubject, type Actor, type QueryClient } from '../access/access.ts'
+import { isWorkingDay } from '../schedule/schedule.ts'
 
 export class LeaveError extends Error {
   code:string
@@ -60,7 +61,11 @@ export async function applyForPaidLeave(client:QueryClient,actor:Actor,input:{wo
   const scheduled=await client.query(
     'SELECT 1 FROM leave_work_dates WHERE employee_id=$1 AND work_date=$2 FOR SHARE',
     [employeeId,workDate])
-  if (!scheduled.rows.length) throw new LeaveError('not_scheduled_work_date')
+  if (!scheduled.rows.length) {
+    // No explicit date: fall back to the employee's assigned shift, which excludes weekly offs and holidays.
+    if (!await isWorkingDay(client,employeeId,workDate)) throw new LeaveError('not_scheduled_work_date')
+    await client.query('INSERT INTO leave_work_dates(employee_id,work_date) VALUES ($1,$2) ON CONFLICT DO NOTHING',[employeeId,workDate])
+  }
   await client.query('INSERT INTO leave_balances(employee_id,month_start) VALUES ($1,$2) ON CONFLICT DO NOTHING',[employeeId,monthStart])
   const locked=await client.query<{credit:unknown,reserved:unknown,used:unknown}>(
     'SELECT credit,reserved,used FROM leave_balances WHERE employee_id=$1 AND month_start=$2 FOR UPDATE',

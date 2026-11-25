@@ -7,14 +7,18 @@ rejection releases it. Dates must be strictly after today's Asia/Kolkata date an
 within the same calendar month. The database holds a single balance row per
 employee and month and serializes writes with `FOR UPDATE`.
 
-The kiosk roster has no work calendar or joining date. We therefore require an
-explicit `leave_work_dates` row for each eligible employee/date. An operator can
-load confirmed dates with `LEAVE_PROVISION_DATABASE_URL` and
+Leave validates dates against the employee's effective shift through
+`features/schedule/schedule.ts`: weekly offs and public holidays are rejected,
+while restricted holidays remain work dates for optional-holiday handling. An
+accepted date is copied to `leave_work_dates` to preserve the existing foreign
+key. Employees without an effective shift assignment must be assigned one
+before applying. For legacy onboarding only, an operator can still register
+explicit dates with `LEAVE_PROVISION_DATABASE_URL` and
 `node --experimental-strip-types features/leave/provision-work-date.ts EMPLOYEE_UUID YYYY-MM-DD`.
-Use a restricted database account for provisioning. This table is a scheduling
-prerequisite, not a payroll entitlement calculation. This slice does not prorate
-for joining date, schedule recurring shifts, pay out unused days, or support
-other leave categories.
+Use a restricted database account for provisioning. This slice does not prorate
+for joining date, calculate payroll pay, or support other leave categories.
+See `PAYROLL-DECISIONS.md` for worked examples and the ELT decisions required
+before attendance deductions and payable units can be implemented.
 
 Managers can decide pending requests only for current assigned reports. Rejection
 requires a reason. HR and admins can change pending or decided requests with a
