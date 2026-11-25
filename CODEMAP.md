@@ -1,7 +1,7 @@
 # ELT Attendance code map
 
 - `contracts/kiosk.md` defines the first online kiosk punch.
-- `apps/android` and `features/biometrics` belong to the Android and biometrics agent.
+- `apps/android` owns the kiosk client. `KioskActivity.kt` handles setup, enrollment, local camera self-test and receipts; `LocalDeviceSetup.kt` and `SetupPolicy.kt` own unmanaged setup storage and validation; `Capture.kt` owns multi-frame liveness capture. `features/biometrics` owns server verification, template storage and operator provisioning.
 - `features/attendance` belongs to the attendance agent. It owns the authoritative PostgreSQL punch transaction.
 - `features/access` belongs to the people agent. It owns employees, account linkage and reader/site authorization.
 - `features/schedule` owns shifts, effective-dated employee/site assignments, holiday calendars, schedule reads and its audit trail. `schedule.ts` publishes `scheduleDays`, `scheduleDay`, `isWorkingDay`, `readSchedule` and holiday/shift lookups for other features; `manage.ts` owns HR mutations.

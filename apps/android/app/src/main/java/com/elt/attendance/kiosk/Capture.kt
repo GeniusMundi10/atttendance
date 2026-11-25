@@ -9,6 +9,7 @@ import kotlin.math.roundToInt
 internal sealed interface CapturePurpose {
     data class Punch(val action: Action, val challenge: Challenge, val roster: List<Template>) : CapturePurpose
     data class Enrollment(val employeeId: String, val code: String) : CapturePurpose
+    data object Diagnostic : CapturePurpose
 }
 internal data class CaptureResult(val frames: JSONArray, val template: Template?, val embedding: JSONArray?)
 

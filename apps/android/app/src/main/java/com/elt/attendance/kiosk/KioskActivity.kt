@@ -2,11 +2,16 @@
 package com.elt.attendance.kiosk
 
 import android.Manifest
+import android.app.AlertDialog
 import android.app.admin.DevicePolicyManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.content.res.ColorStateList
+import android.view.Gravity
 import android.hardware.camera2.CameraCharacteristics
 import android.os.Bundle
 import android.os.Handler
@@ -16,8 +21,13 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
@@ -48,7 +58,13 @@ internal class KioskActivity : ComponentActivity() {
     private lateinit var checkOut: Button
     private lateinit var retry: Button
     private lateinit var enroll: Button
+    private lateinit var selfTest: Button
+    private lateinit var returnToSetup: Button
+    private lateinit var admin: Button
+    private lateinit var consent: CheckBox
     private lateinit var codeInput: EditText
+    private var firstRunPanel: View? = null
+    private var localTestMode = false
     private var camera: ProcessCameraProvider? = null
     private var engine: FaceEngine? = null
     private var pending: PendingPunch? = null
@@ -66,22 +82,18 @@ internal class KioskActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or WindowManager.LayoutParams.FLAG_SECURE)
         drawScreen()
-        config = runCatching { KioskConfig.read(this) }.getOrElse {
-            message("This kiosk needs company management configuration.")
+        config = runCatching { KioskConfig.read(this) }.getOrNull() ?: run {
+            showFirstRunSetup()
             return
         }
         if (config.mode == Mode.PROVISION) {
             showProvisioning()
             return
         }
-        if (config.mode == Mode.KIOSK &&
-            !getSystemService(DevicePolicyManager::class.java).isLockTaskPermitted(packageName)) {
-            message("This kiosk must be in the company’s managed lock task allowlist.")
-            return
-        }
 
 
         codeInput.visibility = if (config.mode == Mode.ENROLL) View.VISIBLE else View.GONE
+        consent.visibility = if (config.mode == Mode.ENROLL) View.VISIBLE else View.GONE
         pendingStore = PendingStore(applicationContext)
         message("Starting kiosk…")
         submit {
@@ -135,6 +147,7 @@ internal class KioskActivity : ComponentActivity() {
 
     private fun drawScreen() {
         val spacing = (16 * resources.displayMetrics.density).toInt()
+        val ink = Color.rgb(26, 25, 23)
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(spacing, spacing, spacing, spacing)
@@ -144,10 +157,22 @@ internal class KioskActivity : ComponentActivity() {
                 insets
             }
         }
-        root.addView(TextView(this).apply { text = "ELT Attendance"; textSize = 28f })
+        root.addView(ImageView(this).apply {
+            setImageResource(com.elt.attendance.kiosk.R.drawable.elt_logo)
+            scaleType = ImageView.ScaleType.FIT_START
+            contentDescription = "ELT Corporate"
+        }, LinearLayout.LayoutParams(-1, (72 * resources.displayMetrics.density).toInt()))
+        root.addView(TextView(this).apply {
+            text = "Attendance"
+            textSize = 31f
+            setTextColor(ink)
+            setTypeface(typeface, Typeface.BOLD)
+            letterSpacing = -.035f
+        })
         status = TextView(this).apply {
-            textSize = 17f
-            setPadding(0, spacing, 0, spacing)
+            textSize = 15f
+            setTextColor(Color.rgb(102, 97, 90))
+            setPadding(0, spacing / 2, 0, spacing)
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
         root.addView(status, LinearLayout.LayoutParams(-1, -2))
@@ -156,13 +181,24 @@ internal class KioskActivity : ComponentActivity() {
             scaleType = PreviewView.ScaleType.FIT_CENTER
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            background = GradientDrawable().apply {
+                setColor(Color.BLACK)
+                cornerRadius = spacing.toFloat()
+            }
+            clipToOutline = true
         }
-        root.addView(viewfinder, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(viewfinder, LinearLayout.LayoutParams(-1, 0, 1f).apply { bottomMargin = spacing })
         actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        checkIn = button("Check in (IN)") { begin(Action.IN) }
-        checkOut = button("Check out (OUT)") { begin(Action.OUT) }
+        checkIn = button("Check in") { begin(Action.IN) }.apply {
+            backgroundTintList = ColorStateList.valueOf(ink)
+            setTextColor(Color.WHITE)
+        }
+        checkOut = button("Check out") { begin(Action.OUT) }.apply {
+            backgroundTintList = ColorStateList.valueOf(Color.rgb(234, 230, 222))
+            setTextColor(ink)
+        }
         actions.addView(checkIn, LinearLayout.LayoutParams(0, -2, 1f))
-        actions.addView(checkOut, LinearLayout.LayoutParams(0, -2, 1f))
+        actions.addView(checkOut, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = spacing / 2 })
         root.addView(actions)
         codeInput = EditText(this).apply {
             hint = "One-time enrollment code"
@@ -172,30 +208,247 @@ internal class KioskActivity : ComponentActivity() {
             visibility = View.GONE
         }
         root.addView(codeInput, LinearLayout.LayoutParams(-1, -2))
+        consent = CheckBox(this).apply {
+            text = "I confirmed the employee completed ELT’s approved biometric notice and consent process."
+            visibility = View.GONE
+        }
+        root.addView(consent, LinearLayout.LayoutParams(-1, -2))
         enroll = button("Capture enrollment") { beginEnrollment() }
         retry = button("Retry pending punch") { retryPunch() }
+        selfTest = button("Test camera") { beginDiagnostic() }
+        returnToSetup = button("Back to device setup") {
+            localTestMode = false
+            camera?.unbindAll()
+            camera = null
+            cameraReady = false
+            usable = false
+            selfTest.visibility = View.GONE
+            returnToSetup.visibility = View.GONE
+            firstRunPanel?.visibility = View.VISIBLE
+            viewfinder.visibility = View.GONE
+            message("Set up this device to connect attendance, or repeat the local camera test.")
+        }.apply { visibility = View.GONE }
+        admin = button("Device administrator setup") { showAdminDialog() }.apply { visibility = View.GONE }
         root.addView(enroll, LinearLayout.LayoutParams(-1, -2))
         root.addView(retry, LinearLayout.LayoutParams(-1, -2))
+        root.addView(selfTest, LinearLayout.LayoutParams(-1, -2))
+        root.addView(returnToSetup, LinearLayout.LayoutParams(-1, -2))
+        root.addView(admin, LinearLayout.LayoutParams(-1, -2))
         setContentView(root)
         render()
     }
 
     private fun button(label: String, action: () -> Unit): Button = Button(this).apply {
         text = label
+        textSize = 15f
+        isAllCaps = false
+        minHeight = (52 * resources.displayMetrics.density).toInt()
+        gravity = Gravity.CENTER
         setOnClickListener { action() }
+    }
+
+    private fun showFirstRunSetup() {
+        viewfinder.visibility = View.GONE
+        actions.visibility = View.GONE
+        codeInput.visibility = View.GONE
+        consent.visibility = View.GONE
+        enroll.visibility = View.GONE
+        retry.visibility = View.GONE
+        selfTest.visibility = View.GONE
+        admin.visibility = View.GONE
+
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val spacing = (12 * resources.displayMetrics.density).toInt()
+            setPadding(0, spacing, 0, spacing)
+        }
+        panel.addView(TextView(this).apply {
+            text = "Unmanaged device setup"
+            textSize = 20f
+        })
+        panel.addView(TextView(this).apply {
+            text = "Enter ELT’s HTTPS attendance service and linked Play Integrity project. This phone will create its own hardware-backed device key."
+            textSize = 15f
+        })
+        val origin = setupField("HTTPS attendance server origin", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        val project = setupField("Play Integrity cloud project number", InputType.TYPE_CLASS_NUMBER)
+        val pin = setupField("Create 8–12 digit device admin PIN", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD)
+        val confirmation = setupField("Confirm device admin PIN", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD)
+        panel.addView(origin, LinearLayout.LayoutParams(-1, -2))
+        panel.addView(project, LinearLayout.LayoutParams(-1, -2))
+        panel.addView(pin, LinearLayout.LayoutParams(-1, -2))
+        panel.addView(confirmation, LinearLayout.LayoutParams(-1, -2))
+        panel.addView(button("Save setup and create device key") {
+            val originValue = origin.text.toString()
+            val projectValue = project.text.toString()
+            val pinValue = pin.text.toString().toCharArray()
+            val confirmationValue = confirmation.text.toString().toCharArray()
+            pin.text.clear()
+            confirmation.text.clear()
+            try {
+                SetupPolicy.origin(originValue)
+                SetupPolicy.cloudProject(projectValue)
+                if (!SetupPolicy.validPin(pinValue) || !pinValue.contentEquals(confirmationValue)) {
+                    throw IllegalArgumentException("Choose and confirm an 8–12 digit PIN.")
+                }
+            } catch (failure: Exception) {
+                pinValue.fill('\u0000')
+                confirmationValue.fill('\u0000')
+                message(failure.message ?: "Check the setup fields and try again.")
+                return@button
+            }
+            message("Saving device setup…")
+            network.execute {
+                try {
+                    val saved = LocalDeviceSetup.initialize(applicationContext, originValue, projectValue, pinValue, confirmationValue)
+                    onScreen {
+                        config = saved
+                        firstRunPanel?.visibility = View.GONE
+                        showProvisioning()
+                    }
+                } catch (_: Exception) {
+                    onScreen { message("Setup could not be saved. Check the server origin and try again.") }
+                } finally {
+                    pinValue.fill('\u0000')
+                    confirmationValue.fill('\u0000')
+                }
+            }
+        }, LinearLayout.LayoutParams(-1, -2))
+        panel.addView(button("Test camera and liveness only (no record)") { startLocalCameraTest() }, LinearLayout.LayoutParams(-1, -2))
+
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(panel)
+        }
+        firstRunPanel = scroll
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        message("No managed setup is required. Set up the phone here, or run a local camera test first.")
+    }
+
+    private fun setupField(hintText: String, type: Int) = EditText(this).apply {
+        hint = hintText
+        inputType = type
+        isSaveEnabled = false
+        importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+    }
+
+    private fun startLocalCameraTest() {
+        localTestMode = true
+        firstRunPanel?.visibility = View.GONE
+        viewfinder.visibility = View.VISIBLE
+        selfTest.visibility = View.VISIBLE
+        returnToSetup.visibility = View.VISIBLE
+        usable = true
+        cameraReady = false
+        message("Local camera self-test: no attendance data will be sent or recorded.")
+        startCamera()
+    }
+
+    private fun showAdminDialog() {
+        val current = LocalDeviceSetup.read(this) ?: run {
+            message("Local administrator setup is unavailable. Contact your system administrator.")
+            return
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val spacing = (12 * resources.displayMetrics.density).toInt()
+            setPadding(spacing, spacing, spacing, 0)
+        }
+        content.addView(TextView(this).apply {
+            text = "Changing mode requires the local admin PIN. Employee face enrollment also needs an active site assignment and a fresh one-time code from the attendance operator."
+        })
+        val modes = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
+        val kioskOption = RadioButton(this).apply { id = View.generateViewId(); text = "Attendance kiosk" }
+        val enrollOption = RadioButton(this).apply { id = View.generateViewId(); text = "Supervised employee enrollment" }
+        modes.addView(kioskOption)
+        modes.addView(enrollOption)
+        if (current.mode == Mode.ENROLL) enrollOption.isChecked = true else kioskOption.isChecked = true
+        content.addView(modes)
+        val employee = setupField("Employee UUID for enrollment", InputType.TYPE_CLASS_TEXT)
+        employee.setText(current.employeeId.orEmpty())
+        employee.visibility = if (enrollOption.isChecked) View.VISIBLE else View.GONE
+        content.addView(employee, LinearLayout.LayoutParams(-1, -2))
+        modes.setOnCheckedChangeListener { _, checkedId ->
+            employee.visibility = if (checkedId == enrollOption.id) View.VISIBLE else View.GONE
+        }
+        val pin = setupField("Device admin PIN", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD)
+        content.addView(pin, LinearLayout.LayoutParams(-1, -2))
+        val feedback = TextView(this)
+        content.addView(feedback)
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Device administrator")
+            .setView(content)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Save mode", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val mode = if (enrollOption.isChecked) Mode.ENROLL else Mode.KIOSK
+                val employeeId = employee.text.toString()
+                val pinValue = pin.text.toString().toCharArray()
+                pin.text.clear()
+                try {
+                    if (!SetupPolicy.validPin(pinValue)) throw IllegalArgumentException("Enter the device admin PIN.")
+                    if (mode == Mode.ENROLL) SetupPolicy.employeeId(employeeId)
+                } catch (failure: Exception) {
+                    pinValue.fill('\u0000')
+                    feedback.text = failure.message ?: "Check the employee ID and try again."
+                    return@setOnClickListener
+                }
+                feedback.text = "Saving device mode…"
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = false
+                network.execute {
+                    val saved = runCatching {
+                        LocalDeviceSetup.setMode(applicationContext, pinValue, mode, employeeId.takeIf { mode == Mode.ENROLL })
+                    }.isSuccess
+                    pinValue.fill('\u0000')
+                    onScreen {
+                        if (saved) {
+                            dialog.dismiss()
+                            recreate()
+                        } else {
+                            feedback.text = "PIN not accepted or mode could not be saved. Try again."
+                            dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = true
+                        }
+                    }
+                }
+            }
+        }
+        dialog.setOnDismissListener { pin.text.clear() }
+        dialog.show()
     }
 
     private fun showProvisioning() {
         viewfinder.visibility = View.GONE
+        actions.visibility = View.GONE
+        codeInput.visibility = View.GONE
+        consent.visibility = View.GONE
+        enroll.visibility = View.GONE
+        retry.visibility = View.GONE
+        selfTest.visibility = View.GONE
+        returnToSetup.visibility = View.GONE
+        firstRunPanel?.visibility = View.GONE
+        admin.visibility = LocalDeviceSetup.isConfigured(this).let { if (it) View.VISIBLE else View.GONE }
+        admin.text = "Configure kiosk or employee enrollment mode"
         submit {
-            val key = DeviceSigner(config.deviceId, create = true).publicKey()
+            val key = DeviceSigner(config.deviceId, true).publicKey()
             onScreen {
+                root.addView(TextView(this).apply {
+                    text = "Device ID: ${config.deviceId}\n\nRegister this ID and public key against an active ELT site using the trusted operator provisioning command. Do not enter a site ID supplied by an unverified source."
+                    textSize = 15f
+                }, LinearLayout.LayoutParams(-1, -2))
+                root.addView(button("Copy this device ID") {
+                    getSystemService(ClipboardManager::class.java).setPrimaryClip(
+                        ClipData.newPlainText("Kiosk device ID", config.deviceId)
+                    )
+                    message("Device ID copied. Keep it with the supervised device-registration request.")
+                }, LinearLayout.LayoutParams(-1, -2))
                 root.addView(button("Copy this device’s public key") {
                     val clipboard = getSystemService(ClipboardManager::class.java)
                     clipboard.setPrimaryClip(ClipData.newPlainText("Kiosk public key", key))
-                    message("Public key copied. Register it for this device in the attendance service.")
-                })
-                message("Register this device’s public key, then return it to managed kiosk mode.")
+                    message("Public key copied. Register it for this device and its assigned site.")
+                }, LinearLayout.LayoutParams(-1, -2))
+                message("This device key is ready. Site registration is an operator-controlled step; no MDM is needed.")
             }
         }
     }
@@ -234,7 +487,7 @@ internal class KioskActivity : ComponentActivity() {
                             }
                             camera = provider
                             cameraReady = true
-                            message(if (config.mode == Mode.ENROLL) "Supervisor enrollment" else "Select IN or OUT to begin.")
+                            message(if (::config.isInitialized && config.mode == Mode.ENROLL) "Supervised employee enrollment" else "Select an action or run the local camera test.")
                         } catch (_: Exception) {
                             message("This front camera cannot verify fresh frames.")
                         }
@@ -260,8 +513,18 @@ internal class KioskActivity : ComponentActivity() {
         }
     }
 
+    private fun beginDiagnostic() {
+        if (!usable || !cameraReady || !visible || busy || pending != null) return
+        val currentFlow = startFlow("Look at the front camera for the live-face self-test…")
+        startCapture(currentFlow, CapturePurpose.Diagnostic)
+    }
+
     private fun beginEnrollment() {
         if (!canCapture()) return
+        if (!consent.isChecked) {
+            message("Confirm the employee completed ELT’s approved biometric notice and consent process before enrollment.")
+            return
+        }
         val code = codeInput.text.toString()
         if (!secretPattern.matches(code)) {
             message("Enter the one-time enrollment code issued by your supervisor.")
@@ -309,6 +572,10 @@ internal class KioskActivity : ComponentActivity() {
     }
 
     private fun completeCapture(purpose: CapturePurpose, result: CaptureResult) {
+        if (purpose is CapturePurpose.Diagnostic) {
+            finishFlow("Live-face camera self-test passed. Nothing was recorded or sent.")
+            return
+        }
         val currentFlow = flow
         message("Confirming with attendance…")
         submit(currentFlow) {
@@ -321,8 +588,12 @@ internal class KioskActivity : ComponentActivity() {
                 }
                 is CapturePurpose.Enrollment -> {
                     api.enroll(purpose.employeeId, purpose.code, checkNotNull(result.embedding), result.frames)
-                    onScreen { finishFlow("Face enrollment saved.") }
+                    onScreen {
+                        consent.isChecked = false
+                        finishFlow("Face enrollment saved.")
+                    }
                 }
+                is CapturePurpose.Diagnostic -> Unit
             }
         }
     }
@@ -390,11 +661,16 @@ internal class KioskActivity : ComponentActivity() {
         val mode = if (::config.isInitialized) config.mode else null
         actions.visibility = if (mode == Mode.KIOSK && pending == null) View.VISIBLE else View.GONE
         enroll.visibility = if (mode == Mode.ENROLL && pending == null) View.VISIBLE else View.GONE
+        consent.visibility = if (mode == Mode.ENROLL) View.VISIBLE else View.GONE
         retry.visibility = if (pending != null) View.VISIBLE else View.GONE
+        selfTest.visibility = if (mode == Mode.KIOSK || localTestMode) View.VISIBLE else View.GONE
+        returnToSetup.visibility = if (localTestMode && firstRunPanel != null) View.VISIBLE else View.GONE
+        admin.visibility = if (LocalDeviceSetup.isConfigured(this)) View.VISIBLE else View.GONE
         val available = usable && cameraReady && !busy && pending == null
         checkIn.isEnabled = available
         checkOut.isEnabled = available
         enroll.isEnabled = available
+        selfTest.isEnabled = available
         retry.isEnabled = usable && !busy && pending?.origin == (if (mode != null) config.origin else null)
             && pending?.deviceId == (if (mode != null) config.deviceId else null) && pending != null
     }

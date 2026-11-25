@@ -1,30 +1,60 @@
-/* PURPOSE: Style the attendance portal with ELT orange and neutral surfaces. */
-:root {color-scheme:light;--ink:#191816;--paper:#f7f5f0;--line:#dedad1;--orange:#ff7a03}
-* {box-sizing:border-box}
-body {margin:0;background:var(--paper);color:var(--ink);font:16px/1.5 Arial,sans-serif;display:grid;grid-template-columns:210px minmax(0,1fr);min-height:100vh}
-aside {padding:30px 24px;border-right:1px solid var(--line);display:flex;align-items:flex-start;flex-direction:column}
-aside img {width:70px;height:70px;object-fit:contain}
-aside small,.ref {color:#625d55}
-aside nav {display:grid;gap:10px;margin-top:28px}
-aside nav a {color:var(--ink);text-decoration:underline;text-decoration-color:var(--orange);text-underline-offset:4px}
-main {padding:clamp(20px,4vw,56px);max-width:1200px}
-h1 {font-size:clamp(30px,4vw,46px);letter-spacing:-.04em;margin:0 0 1rem}
-h2 {margin:2rem 0 0;font-size:1.35rem}
-header,.controls {display:flex;align-items:center;justify-content:space-between;gap:16px}
-.controls {justify-content:flex-start;align-items:flex-end}
-button,input,select,textarea {font:inherit;padding:10px 14px;border:1px solid var(--line);border-radius:6px}
-button {background:var(--ink);color:white;cursor:pointer}
-button.secondary {background:transparent;color:var(--ink)}
-button:disabled {opacity:.6}
-:focus-visible {outline:3px solid var(--orange);outline-offset:2px}
-form,label {display:grid;gap:6px}
-form {max-width:360px;gap:14px}
-.wide-form {max-width:720px}
-.date-row {display:flex;gap:12px;align-items:end;flex-wrap:wrap;padding:12px 0;border-bottom:1px solid var(--line)}
-.date-row label {min-width:140px}
-.tag {font-size:12px;color:#625d55;display:block}
-.status-card {border:1px solid var(--line);border-radius:8px;padding:16px;margin:12px 0;background:white}
-table {width:100%;border-collapse:collapse;text-align:left}
-th,td {padding:12px 6px;border-bottom:1px solid var(--line)}
-.ref {font:12px/1.4 monospace;overflow-wrap:anywhere}
-@media(max-width:700px){body{display:block}aside{flex-direction:row;align-items:center;gap:12px;flex-wrap:wrap;border-right:0;border-bottom:1px solid var(--line);padding:4px 16px}aside nav{display:flex;gap:16px;margin:0;width:100%}aside img{width:48px;height:48px}.ref{font-size:10px}}
+/* PURPOSE: Keep ELT's portal calm, readable, and consistent across desktop and mobile. */
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap');
+:root{color-scheme:light;--ink:#1a1917;--muted:#75716b;--paper:#f7f5f1;--surface:#fffefa;--line:#e6e2db;--orange:#ff7a03}
+*{box-sizing:border-box}
+html{font-family:'DM Sans',Arial,sans-serif}
+body{margin:0;min-height:100vh;display:grid;grid-template-columns:244px minmax(0,1fr);background:var(--paper);color:var(--ink);font-size:15px;line-height:1.5}
+aside{position:sticky;top:0;height:100vh;padding:30px 20px;border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:flex-start;gap:2px}
+aside img{width:82px;height:58px;object-fit:contain;object-position:left center;margin-bottom:12px}
+aside strong{font-size:17px;letter-spacing:-.03em}
+aside small{color:var(--muted);font-size:13px}
+aside nav{display:grid;gap:5px;width:100%;margin-top:34px}
+aside nav a{padding:11px 13px;border-radius:10px;color:#5e5a54;text-decoration:none;font-weight:600}
+aside nav a:hover,aside nav a:focus-visible{background:#eeeae3;color:var(--ink)}
+main{width:100%;max-width:1380px;margin:auto;padding:clamp(24px,4vw,58px)}
+section{min-width:0}
+h1{font-size:clamp(34px,4vw,48px);line-height:1.1;letter-spacing:-.055em;font-weight:700;margin:0 0 32px}
+h2{font-size:20px;line-height:1.25;letter-spacing:-.035em;margin:38px 0 14px}
+h3{letter-spacing:-.025em}
+p{color:var(--muted)}
+header,.controls{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.controls{justify-content:flex-start;align-items:flex-end;flex-wrap:wrap;margin:20px 0}
+button,input,select,textarea{font:inherit;border:1px solid var(--line);border-radius:9px;padding:11px 14px;min-height:44px}
+input,select,textarea{background:var(--surface);color:var(--ink)}
+input:focus,select:focus,textarea:focus{border-color:var(--orange);outline:none;box-shadow:0 0 0 3px #ff7a0322}
+button{background:var(--ink);color:white;border-color:var(--ink);font-weight:600;cursor:pointer;transition:background .15s,transform .15s}
+button:hover:not(:disabled){background:#36322d;transform:translateY(-1px)}
+button.secondary{background:var(--surface);color:var(--ink);border-color:var(--line)}
+button.secondary:hover:not(:disabled){background:#eeeae3}
+button:disabled{opacity:.5;cursor:not-allowed}
+:focus-visible{outline:3px solid var(--orange);outline-offset:2px}
+form,label{display:grid;gap:7px}
+form{max-width:380px;gap:16px}
+label{font-size:13px;color:#5e5a54;font-weight:600}
+label input,label select,label textarea{font-size:15px;font-weight:400}
+.wide-form{max-width:740px}
+.date-row{display:flex;gap:14px;align-items:end;flex-wrap:wrap;padding:15px 0;border-bottom:1px solid var(--line)}
+.date-row label{min-width:140px}
+.tag{font-size:12px;color:var(--muted);display:block;font-weight:500}
+.status-card{border:1px solid var(--line);border-radius:12px;padding:20px;margin:14px 0;background:var(--surface);box-shadow:0 2px 14px #26201608}
+table{width:100%;border-collapse:collapse;text-align:left;background:var(--surface);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+th,td{padding:15px 18px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;background:#f1eee8}
+tr:last-child td{border-bottom:0}
+tr:hover td{background:#faf7f1}
+.ref{font:12px/1.5 monospace;color:var(--muted);overflow-wrap:anywhere}
+@media(max-width:760px){
+  body{display:block}
+  aside{position:static;height:auto;padding:12px 18px;display:grid;grid-template-columns:52px 1fr;column-gap:10px;border-right:0;border-bottom:1px solid var(--line)}
+  aside img{width:52px;height:42px;margin:0;grid-row:span 2}
+  aside strong{align-self:end}
+  aside small{align-self:start}
+  aside nav{grid-column:1/-1;display:flex;overflow-x:auto;gap:4px;margin:10px 0 0}
+  aside nav a{white-space:nowrap;padding:9px 11px;font-size:13px}
+  main{padding:24px 18px 50px}
+  h1{margin-bottom:22px}
+  header{align-items:flex-start}
+  table{display:block;overflow-x:auto}
+  th,td{min-width:110px;padding:12px}
+  .ref{font-size:11px}
+}

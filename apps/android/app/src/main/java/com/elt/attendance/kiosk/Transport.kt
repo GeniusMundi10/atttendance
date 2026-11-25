@@ -36,15 +36,15 @@ internal enum class Action { IN, OUT }
 
 internal data class KioskConfig(val origin: String, val deviceId: String, val cloudProject: Long, val mode: Mode, val employeeId: String?) {
     companion object {
-        fun read(context: Context): KioskConfig {
+        fun read(context: Context): KioskConfig? {
             val values = context.getSystemService(RestrictionsManager::class.java).applicationRestrictions
-            val origin = URI(values.getString("baseUrl") ?: "")
-            require(origin.scheme == "https" && origin.host != null && origin.userInfo == null &&
-                origin.rawQuery == null && origin.rawFragment == null && origin.path in listOf("", "/"))
+            val hasManagedConnection = listOf("deviceId", "baseUrl", "cloudProject").any(values::containsKey)
+            if (!hasManagedConnection) return LocalDeviceSetup.read(context)
+
+            val origin = SetupPolicy.origin(values.getString("baseUrl") ?: "")
             val deviceId = values.getString("deviceId") ?: ""
             require(uuidPattern.matches(deviceId))
-            val cloudProject = values.getString("cloudProject")?.toLongOrNull() ?: 0
-            require(cloudProject > 0)
+            val cloudProject = SetupPolicy.cloudProject(values.getString("cloudProject") ?: "")
             val mode = when (values.getString("mode", "kiosk")) {
                 "kiosk" -> Mode.KIOSK
                 "provision" -> Mode.PROVISION
@@ -52,8 +52,8 @@ internal data class KioskConfig(val origin: String, val deviceId: String, val cl
                 else -> error("Unsupported kiosk mode")
             }
             val employeeId = values.getString("employeeId")
-            if (mode == Mode.ENROLL) require(employeeId != null && uuidPattern.matches(employeeId))
-            return KioskConfig(origin.toASCIIString().trimEnd('/'), deviceId, cloudProject, mode, employeeId)
+            if (mode == Mode.ENROLL) SetupPolicy.employeeId(employeeId ?: "")
+            return KioskConfig(origin, deviceId, cloudProject, mode, employeeId)
         }
     }
 }

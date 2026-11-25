@@ -77,6 +77,7 @@ dependencies {
     implementation("org.opencv:opencv:4.12.0")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
     implementation("com.google.android.play:integrity:1.6.0")
+    testImplementation("junit:junit:4.13.2")
 }
 
 val zoo = "https://media.githubusercontent.com/media/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models"
