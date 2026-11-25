@@ -9,18 +9,27 @@ export interface QueryClient {
 export interface VerifiedSubject {
   authProvider: string;
   authSubject: string;
+  aal?: string;
 }
 
 export interface Actor {
   employeeId: string;
   authProvider: string;
   authSubject: string;
+  aal?: string;
 }
 
 export class AccessDeniedError extends Error {
   constructor(message = 'Access denied') {
     super(message);
     this.name = 'AccessDeniedError';
+  }
+}
+
+export class AccessMfaRequiredError extends AccessDeniedError {
+  constructor() {
+    super('MFA required');
+    this.name = 'AccessMfaRequiredError';
   }
 }
 
@@ -46,7 +55,7 @@ export async function checkKioskEligibility(
   if (result.rows.length !== 1) throw new AccessDeniedError('Employee is not active at this site');
 }
 
-/** The caller must verify the authentication token before passing its issuer and subject. */
+/** The caller must verify the token before passing its issuer, subject, and AAL. */
 export async function resolveAuthenticatedSubject(
   client: QueryClient,
   subject: VerifiedSubject,
@@ -54,19 +63,24 @@ export async function resolveAuthenticatedSubject(
   if (!nonempty(subject.authProvider) || !nonempty(subject.authSubject)) {
     throw new AccessDeniedError();
   }
-  const result = await client.query<{ employee_id: string }>(
-    `SELECT l.employee_id
+  const result = await client.query<{ employee_id: string; operator_role: string | null }>(
+    `SELECT l.employee_id, r.role AS operator_role
        FROM access_subject_links l
        JOIN access_employees e ON e.id = l.employee_id
+       LEFT JOIN access_operator_roles r ON r.employee_id = e.id AND r.active
       WHERE l.auth_provider = $1 AND l.auth_subject = $2
         AND l.active AND e.active`,
     [subject.authProvider, subject.authSubject],
   );
   if (result.rows.length !== 1) throw new AccessDeniedError();
+  if (result.rows[0]!.operator_role && subject.aal !== 'aal2') {
+    throw new AccessMfaRequiredError();
+  }
   return {
     employeeId: result.rows[0]!.employee_id,
     authProvider: subject.authProvider,
     authSubject: subject.authSubject,
+    aal: subject.aal,
   };
 }
 

@@ -7,9 +7,11 @@ The attendance transaction passes its existing `pg` client to
 This call holds share locks on the active employee, site, and assignment rows until
 the transaction ends. A failure throws `AccessDeniedError`.
 
-After verifying a JWT signature, issuer, audience, and expiry, the server passes
-its trusted issuer and subject to `resolveAuthenticatedSubject(client,
-{ authProvider, authSubject })`. The returned actor is passed to
+After verifying a JWT signature, issuer, audience, expiry, and AAL, the server passes
+its trusted claims to `resolveAuthenticatedSubject(client,
+{ authProvider, authSubject, aal })`. Active HR/ADMIN operators require `aal2`;
+otherwise this call throws `AccessMfaRequiredError`. The returned actor carries
+the AAL and is passed to
 `authorizeReceiptRead(client, { actor, employeeId })`. Both deny inactive or
 unlinked employees. Roles and manager relationships come only from the database.
 `listReadableEmployees(client, actor, { limit, offset })` returns a bounded

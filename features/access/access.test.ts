@@ -6,6 +6,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import {
   AccessDeniedError,
+  AccessMfaRequiredError,
   authorizeReceiptRead,
   checkKioskEligibility,
   listReadableEmployees,
@@ -32,6 +33,27 @@ test('unverified or mismatched subjects cannot select another employee', async (
       employeeId: otherId,
     }),
     AccessDeniedError,
+  );
+});
+
+test('active operator role requires trusted aal2 even for own receipt access', async () => {
+  const employeeId = randomUUID();
+  const client = {
+    async query(sql: string) {
+      if (sql.includes('access_subject_links')) {
+        return { rows: [{ employee_id: employeeId, operator_role: 'HR' }] };
+      }
+      throw new Error('Reader query must not run before MFA');
+    },
+  } as unknown as QueryClient;
+  const subject = { authProvider: 'issuer', authSubject: 'subject' };
+  await assert.rejects(resolveAuthenticatedSubject(client, subject), AccessMfaRequiredError);
+  await assert.rejects(resolveAuthenticatedSubject(client, { ...subject, aal: 'aal1' }), AccessMfaRequiredError);
+  const actor = await resolveAuthenticatedSubject(client, { ...subject, aal: 'aal2' });
+  assert.equal(actor.aal, 'aal2');
+  await assert.rejects(
+    authorizeReceiptRead(client, { actor: { ...actor, aal: 'aal1' }, employeeId }),
+    AccessMfaRequiredError,
   );
 });
 
@@ -72,7 +94,9 @@ test('access decisions use active mapping and database reader scope', {
     const employeeActor = await resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: employee });
     const managerActor = await resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: manager });
     const outsiderActor = await resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: outsider });
-    const hrActor = await resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: hr });
+    await assert.rejects(resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: hr }), AccessMfaRequiredError);
+    await assert.rejects(resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: hr, aal: 'aal1' }), AccessMfaRequiredError);
+    const hrActor = await resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: hr, aal: 'aal2' });
     await authorizeReceiptRead(client, { actor: employeeActor, employeeId: employee });
     await authorizeReceiptRead(client, { actor: managerActor, employeeId: employee });
     await authorizeReceiptRead(client, { actor: hrActor, employeeId: employee });
