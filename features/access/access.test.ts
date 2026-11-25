@@ -1,0 +1,96 @@
+// PURPOSE: Verify access decisions against isolated PostgreSQL rows with synthetic identities.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import {
+  AccessDeniedError,
+  authorizeReceiptRead,
+  checkKioskEligibility,
+  listReadableEmployees,
+  resolveAuthenticatedSubject,
+} from './access.ts';
+import type { QueryClient } from './access.ts';
+
+test('unverified or mismatched subjects cannot select another employee', async () => {
+  const employeeId = randomUUID();
+  const otherId = randomUUID();
+  const client = {
+    async query(sql: string) {
+      if (sql.includes('access_subject_links')) return { rows: [{ employee_id: employeeId }] };
+      throw new Error('Reader query must not run for a mismatched actor');
+    },
+  } as unknown as QueryClient;
+  await assert.rejects(
+    resolveAuthenticatedSubject(client, { authProvider: '', authSubject: 'subject' }),
+    AccessDeniedError,
+  );
+  await assert.rejects(
+    authorizeReceiptRead(client, {
+      actor: { employeeId: otherId, authProvider: 'issuer', authSubject: 'subject' },
+      employeeId: otherId,
+    }),
+    AccessDeniedError,
+  );
+});
+
+test('access decisions use active mapping and database reader scope', {
+  skip: !process.env.ACCESS_TEST_DATABASE_URL && 'Set ACCESS_TEST_DATABASE_URL for PostgreSQL test',
+}, async () => {
+  const pg = await import('pg');
+  const client = new pg.default.Client({ connectionString: process.env.ACCESS_TEST_DATABASE_URL });
+  const schema = `access_test_${randomUUID().replaceAll('-', '')}`;
+  await client.connect();
+  try {
+    await client.query(`CREATE SCHEMA "${schema}"`);
+    await client.query(`SET search_path TO "${schema}"`);
+    const migration = await readFile(fileURLToPath(new URL('./migrations/001_access.sql', import.meta.url)), 'utf8');
+    await client.query(migration);
+
+    const employee = randomUUID();
+    const manager = randomUUID();
+    const outsider = randomUUID();
+    const hr = randomUUID();
+    const site = randomUUID();
+    const otherSite = randomUUID();
+    const provider = 'test-issuer';
+    for (const [id, name] of [[employee, 'Employee'], [manager, 'Manager'], [outsider, 'Outsider'], [hr, 'HR']]) {
+      await client.query('INSERT INTO access_employees (id, display_name) VALUES ($1, $2)', [id, name]);
+      await client.query('INSERT INTO access_subject_links (auth_provider, auth_subject, employee_id) VALUES ($1, $2, $3)', [provider, id, id]);
+    }
+    await client.query('INSERT INTO access_sites (id, name) VALUES ($1, $2), ($3, $4)', [site, 'Site', otherSite, 'Other']);
+    await client.query('INSERT INTO access_employee_sites (employee_id, site_id) VALUES ($1, $2)', [employee, site]);
+    await client.query('INSERT INTO access_manager_reports (manager_id, report_id) VALUES ($1, $2)', [manager, employee]);
+    await client.query("INSERT INTO access_operator_roles (employee_id, role) VALUES ($1, 'HR')", [hr]);
+
+    await client.query('BEGIN');
+    await checkKioskEligibility(client, { employeeId: employee, siteId: site });
+    await client.query('COMMIT');
+    await assert.rejects(checkKioskEligibility(client, { employeeId: employee, siteId: otherSite }), AccessDeniedError);
+
+    const employeeActor = await resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: employee });
+    const managerActor = await resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: manager });
+    const outsiderActor = await resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: outsider });
+    const hrActor = await resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: hr });
+    await authorizeReceiptRead(client, { actor: employeeActor, employeeId: employee });
+    await authorizeReceiptRead(client, { actor: managerActor, employeeId: employee });
+    await authorizeReceiptRead(client, { actor: hrActor, employeeId: employee });
+    await assert.rejects(authorizeReceiptRead(client, { actor: outsiderActor, employeeId: employee }), AccessDeniedError);
+    await assert.rejects(authorizeReceiptRead(client, { actor: { ...employeeActor, employeeId: hr }, employeeId: employee }), AccessDeniedError);
+    assert.deepEqual((await listReadableEmployees(client, employeeActor)).map(e => e.employeeId), [employee]);
+    assert.deepEqual((await listReadableEmployees(client, managerActor)).map(e => e.employeeId).sort(), [employee, manager].sort());
+    assert.equal((await listReadableEmployees(client, hrActor)).length, 4);
+    await assert.rejects(resolveAuthenticatedSubject(client, { authProvider: 'wrong', authSubject: employee }), AccessDeniedError);
+
+    await client.query('UPDATE access_employee_sites SET active = false WHERE employee_id = $1 AND site_id = $2', [employee, site]);
+    await assert.rejects(checkKioskEligibility(client, { employeeId: employee, siteId: site }), AccessDeniedError);
+    await client.query('UPDATE access_employees SET active = false WHERE id = $1', [employee]);
+    await assert.rejects(resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: employee }), AccessDeniedError);
+    await assert.rejects(authorizeReceiptRead(client, { actor: hrActor, employeeId: employee }), AccessDeniedError);
+  } finally {
+    await client.query('RESET search_path');
+    await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await client.end();
+  }
+});
