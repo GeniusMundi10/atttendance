@@ -43,6 +43,38 @@ th{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute
 tr:last-child td{border-bottom:0}
 tr:hover td{background:#faf7f1}
 .ref{font:12px/1.5 monospace;color:var(--muted);overflow-wrap:anywhere}
+.face-enrollment,.hr-reset{border:1px solid var(--line);border-radius:14px;padding:clamp(16px,3vw,24px);margin:26px 0;background:var(--surface);box-shadow:0 2px 14px #26201608}
+.face-heading{align-items:flex-start}
+.face-heading h2,.hr-reset h2{margin:0 0 8px}
+.face-heading button{flex:none}
+.face-intro{margin:0 0 12px;max-width:65ch}
+.readiness-panel,.registered-panel,.enrollment-panel,.enrollment-unavailable,.notice-panel,.reset-confirmation{border:1px solid var(--line);border-radius:11px;padding:16px;margin:14px 0;background:#fff}
+.readiness-panel{display:grid;grid-template-columns:1fr auto;align-items:center;gap:4px 12px}
+.readiness-panel p{grid-column:1/-1;margin:4px 0 0;font-size:13px}
+.readiness-ready{color:#216c42;font-weight:700}
+.readiness-unavailable{color:#9a3c24;font-weight:700}
+.registered-panel{border-color:#b9d9c5;background:#f5fbf6}
+.registered-panel strong{color:#216c42}
+.registered-panel p,.enrollment-unavailable p{margin:6px 0 0}
+.enrollment-panel>label{max-width:440px}
+.selected-site{margin:0 0 14px}
+.notice-panel{background:#faf8f4}
+.notice-panel p{white-space:pre-wrap;margin:6px 0}
+.notice-panel small{color:var(--muted)}
+.issued-code{margin:18px 0;padding:18px;border-radius:12px;background:#f5f1e9;text-align:center}
+.face-code-visual{display:flex;justify-content:center;align-items:center;gap:14px;font:700 clamp(32px,7vw,48px)/1.15 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.12em;color:var(--ink);font-variant-numeric:tabular-nums}
+.face-code-visual span{padding:5px 9px;border-bottom:3px solid var(--orange)}
+.issued-code p{margin:10px 0 0}
+.issued-code .expiry{font-size:13px;font-weight:600;color:#514c45}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.active-code-note{padding:12px;border-left:3px solid var(--orange);background:#fff8ef}
+.code-actions{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:16px}
+.code-actions .tag{max-width:42ch}
+.reset-confirmation{border-color:#e7c8a5;background:#fffaf2}
+.reset-confirmation h3{margin:0 0 8px}
+.reset-confirmation p{overflow-wrap:anywhere}
+.reset-confirmation .controls{margin-bottom:0}
+.portal-message{color:#7a311d}
 @media(max-width:760px){
   body{display:block}
   aside{position:static;height:auto;padding:12px 18px;display:grid;grid-template-columns:52px 1fr;column-gap:10px;border-right:0;border-bottom:1px solid var(--line)}
@@ -57,4 +89,12 @@ tr:hover td{background:#faf7f1}
   table{display:block;overflow-x:auto}
   th,td{min-width:110px;padding:12px}
   .ref{font-size:11px}
+  .face-heading{flex-direction:column;align-items:stretch}
+  .face-heading button{align-self:flex-start}
+  .face-enrollment,.hr-reset{padding:16px;margin:22px 0}
+  .code-actions{align-items:flex-start;flex-direction:column}
+  .code-actions button{width:100%}
+  .readiness-panel{grid-template-columns:1fr auto}
+  .reset-confirmation .controls{align-items:stretch;flex-direction:column}
+  .reset-confirmation .controls button{width:100%}
 }

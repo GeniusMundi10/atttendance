@@ -41,6 +41,9 @@ async function main() {
       if (result.rowCount !== 1) throw new Error("Device or site unavailable");
     } else if (command === "enrollment-code" && !keyText) {
       const codeHash = hash(await inputCode());
+      await client.query(`INSERT INTO kiosk_face_registrations(employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING`, [relatedId]);
+      const registration = await client.query(`SELECT template_id FROM kiosk_face_registrations WHERE employee_id = $1 FOR UPDATE`, [relatedId]);
+      if (!registration.rows[0] || registration.rows[0].template_id) throw new Error("Employee face registration is already closed");
       const assignment = await client.query(`
         SELECT 1 FROM kiosk_biometric_devices device
         JOIN access_sites site ON site.id = device.site_id AND site.active

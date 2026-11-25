@@ -20,6 +20,14 @@ and the maximum is 100.
 Configure `authProvider` to the verified issuer string; the exact value used in
 provisioning must match it.
 
+Biometric enrollment uses `listActiveSiteAssignments(client, employeeId)` to
+return only active employee assignments to active sites as
+`{ siteId, siteName }[]`. HR reset code must call
+`authorizeFaceRegistrationReset(client, { actor, employeeId })` in its database
+transaction. It resolves the linked subject again, requires trusted `aal2`,
+requires an active HR/ADMIN role from the database, and rejects managers,
+receipt readers, and inactive/unlinked actors. The target employee must exist.
+
 Provisioning is an offline operator command requiring a privileged database URL
 in `ACCESS_DATABASE_URL`; it must never be exposed as an HTTP endpoint. Commands:
 

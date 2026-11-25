@@ -5,6 +5,9 @@ node_modules/
 **/build/
 **/.gradle/
 local.properties
+.agent-worktrees/
+.manus/
+design-mockups/
 *.jks
 *.keystore
 dist/

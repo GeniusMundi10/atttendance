@@ -17,6 +17,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
+import android.text.InputFilter
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
@@ -41,6 +42,8 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicReference
+import java.util.UUID
+import java.time.Instant
 
 internal class KioskActivity : ComponentActivity() {
     private val main = Handler(Looper.getMainLooper())
@@ -63,16 +66,47 @@ internal class KioskActivity : ComponentActivity() {
     private lateinit var admin: Button
     private lateinit var consent: CheckBox
     private lateinit var codeInput: EditText
+    private lateinit var selfCodeInput: EditText
+    private lateinit var selfConsent: CheckBox
+    private lateinit var enrollmentEntry: LinearLayout
+    private lateinit var enrollmentGuide: LinearLayout
+    private lateinit var enrollmentGuideScroll: ScrollView
+    private lateinit var enrollmentRecovery: LinearLayout
+    private lateinit var enrollmentSuccess: LinearLayout
+    private lateinit var enrollmentHeading: TextView
+    private lateinit var enrollmentSite: TextView
+    private lateinit var enrollmentNotice: TextView
+    private lateinit var enrollmentInstruction: TextView
+    private lateinit var captureProgress: TextView
+    private lateinit var recoveryText: TextView
+    private lateinit var successText: TextView
+    private lateinit var continueEnrollment: Button
+    private lateinit var cancelEnrollmentButton: Button
+    private lateinit var startEnrollmentCapture: Button
+    private lateinit var retryEnrollmentStatus: Button
+    private lateinit var cancelRecoveredEnrollment: Button
+    private lateinit var checkInAfterEnrollment: Button
+    private lateinit var finishEnrollment: Button
     private var firstRunPanel: View? = null
     private var localTestMode = false
     private var camera: ProcessCameraProvider? = null
     private var engine: FaceEngine? = null
     private var pending: PendingPunch? = null
+    private lateinit var enrollmentStore: EnrollmentRecoveryStore
+    private var enrollmentReference: EnrollmentReference? = null
+    private var activeEnrollmentClaim: EnrollmentClaim? = null
+    private var ephemeralEnrollmentCode: String? = null
+    private var recoveredEmployeeName: String? = null
+    private var recoveredSiteName: String? = null
+    private var cancellationRequested = false
+    private var enrollmentUi = EnrollmentUi.IDLE
     private var visible = false
     private var usable = false
     private var cameraReady = false
     private var busy = false
     private var flow = 0
+
+    private enum class EnrollmentUi { IDLE, ENTRY, CLAIMING, GUIDE, CAPTURING, SAVING, RECOVERING, SUCCESS }
 
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
         if (allowed) attachCamera() else message("Allow camera access to verify attendance.")
@@ -95,6 +129,8 @@ internal class KioskActivity : ComponentActivity() {
         codeInput.visibility = if (config.mode == Mode.ENROLL) View.VISIBLE else View.GONE
         consent.visibility = if (config.mode == Mode.ENROLL) View.VISIBLE else View.GONE
         pendingStore = PendingStore(applicationContext)
+        enrollmentStore = EnrollmentRecoveryStore(applicationContext)
+        enrollmentReference = enrollmentStore.read()
         message("Starting kiosk…")
         submit {
             val signer = DeviceSigner(config.deviceId, false)
@@ -108,7 +144,12 @@ internal class KioskActivity : ComponentActivity() {
             onScreen {
                 pending = saved
                 usable = true
-                if (saved != null) {
+                if (config.mode == Mode.KIOSK && enrollmentReference != null) {
+                    enrollmentUi = EnrollmentUi.RECOVERING
+                    message("Checking registration…")
+                    recoverEnrollmentStatus(checkNotNull(enrollmentReference), startup = true)
+                    if (saved == null) startCamera()
+                } else if (saved != null) {
                     message("A punch is awaiting confirmation. Retry to read its receipt.")
                 } else {
                     startCamera()
@@ -132,7 +173,16 @@ internal class KioskActivity : ComponentActivity() {
 
     override fun onStop() {
         visible = false
-        if (activeCapture.getAndSet(null) != null) finishFlow("Camera capture stopped. Select an action to try again.")
+        if (activeCapture.getAndSet(null) != null) finishFlow("Camera capture stopped.")
+        if (::enrollmentStore.isInitialized && config.mode == Mode.KIOSK && enrollmentReference != null &&
+            enrollmentUi != EnrollmentUi.SUCCESS && enrollmentUi != EnrollmentUi.IDLE) {
+            selfCodeInput.setText("")
+            requestEnrollmentCancellation("Enrollment was cancelled when the screen left the kiosk.")
+        } else if (::selfCodeInput.isInitialized && enrollmentUi == EnrollmentUi.ENTRY) {
+            selfCodeInput.setText("")
+            enrollmentUi = EnrollmentUi.IDLE
+            render()
+        }
         super.onStop()
     }
 
@@ -188,6 +238,114 @@ internal class KioskActivity : ComponentActivity() {
             clipToOutline = true
         }
         root.addView(viewfinder, LinearLayout.LayoutParams(-1, 0, 1f).apply { bottomMargin = spacing })
+        enrollmentEntry = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        enrollmentEntry.addView(TextView(this).apply {
+            text = "Enter your six-digit code"
+            textSize = 21f
+            setTextColor(ink)
+            setTypeface(typeface, Typeface.BOLD)
+        }, LinearLayout.LayoutParams(-1, -2))
+        selfCodeInput = EditText(this).apply {
+            hint = "Six-digit code"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            filters = arrayOf<InputFilter>(android.text.method.DigitsKeyListener.getInstance("0123456789"), InputFilter.LengthFilter(6))
+            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            isSaveEnabled = false
+            isSingleLine = true
+            contentDescription = "Six-digit face enrollment code"
+        }
+        enrollmentEntry.addView(selfCodeInput, LinearLayout.LayoutParams(-1, -2))
+        continueEnrollment = button("Continue") { continueSelfServiceEnrollment() }
+        cancelEnrollmentButton = button("Cancel") { cancelSelfServiceEnrollment() }
+        selfCodeInput.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+            override fun afterTextChanged(s: android.text.Editable?) {
+                continueEnrollment.isEnabled = !busy && EnrollmentPolicy.validCode(s?.toString().orEmpty())
+            }
+        })
+        enrollmentEntry.addView(continueEnrollment, LinearLayout.LayoutParams(-1, -2))
+        enrollmentEntry.addView(cancelEnrollmentButton, LinearLayout.LayoutParams(-1, -2))
+        root.addView(enrollmentEntry, LinearLayout.LayoutParams(-1, -2))
+
+        enrollmentGuide = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        enrollmentHeading = TextView(this).apply {
+            textSize = 22f
+            setTextColor(ink)
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        enrollmentSite = TextView(this).apply { textSize = 16f; setTextColor(ink) }
+        enrollmentNotice = TextView(this).apply {
+            textSize = 15f
+            setTextColor(ink)
+            setPadding(0, spacing / 2, 0, spacing / 2)
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+        }
+        selfConsent = CheckBox(this).apply {
+            textSize = 15f
+            setOnCheckedChangeListener { _, _ -> render() }
+        }
+        enrollmentInstruction = TextView(this).apply {
+            textSize = 16f
+            setTextColor(ink)
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        captureProgress = TextView(this).apply {
+            textSize = 15f
+            setTextColor(Color.rgb(102, 97, 90))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        startEnrollmentCapture = button("Agree and start camera") { startSelfServiceCapture() }
+        val cancelGuide = button("Cancel") { cancelSelfServiceEnrollment() }
+        enrollmentGuide.addView(enrollmentHeading, LinearLayout.LayoutParams(-1, -2))
+        enrollmentGuide.addView(enrollmentSite, LinearLayout.LayoutParams(-1, -2))
+        enrollmentGuide.addView(enrollmentNotice, LinearLayout.LayoutParams(-1, -2))
+        enrollmentGuide.addView(selfConsent, LinearLayout.LayoutParams(-1, -2))
+        enrollmentGuide.addView(enrollmentInstruction, LinearLayout.LayoutParams(-1, -2))
+        enrollmentGuide.addView(captureProgress, LinearLayout.LayoutParams(-1, -2))
+        enrollmentGuide.addView(startEnrollmentCapture, LinearLayout.LayoutParams(-1, -2))
+        enrollmentGuide.addView(cancelGuide, LinearLayout.LayoutParams(-1, -2))
+        enrollmentGuideScroll = ScrollView(this).apply {
+            isFillViewport = true
+            visibility = View.GONE
+            addView(enrollmentGuide)
+        }
+        root.addView(enrollmentGuideScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        enrollmentRecovery = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        recoveryText = TextView(this).apply { textSize = 16f; setTextColor(ink) }
+        retryEnrollmentStatus = button("Check registration status") { retryEnrollmentRecovery() }
+        cancelRecoveredEnrollment = button("Cancel enrollment") { cancelSelfServiceEnrollment() }
+        enrollmentRecovery.addView(recoveryText, LinearLayout.LayoutParams(-1, -2))
+        enrollmentRecovery.addView(retryEnrollmentStatus, LinearLayout.LayoutParams(-1, -2))
+        enrollmentRecovery.addView(cancelRecoveredEnrollment, LinearLayout.LayoutParams(-1, -2))
+        root.addView(enrollmentRecovery, LinearLayout.LayoutParams(-1, -2))
+
+        enrollmentSuccess = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        successText = TextView(this).apply {
+            textSize = 19f
+            setTextColor(ink)
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        checkInAfterEnrollment = button("Check in") { beginCheckInAfterEnrollment() }
+        finishEnrollment = button("Finish") { finishSelfServiceEnrollment() }
+        enrollmentSuccess.addView(successText, LinearLayout.LayoutParams(-1, -2))
+        enrollmentSuccess.addView(checkInAfterEnrollment, LinearLayout.LayoutParams(-1, -2))
+        enrollmentSuccess.addView(finishEnrollment, LinearLayout.LayoutParams(-1, -2))
+        root.addView(enrollmentSuccess, LinearLayout.LayoutParams(-1, -2))
+
         actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         checkIn = button("Check in") { begin(Action.IN) }.apply {
             backgroundTintList = ColorStateList.valueOf(ink)
@@ -213,7 +371,9 @@ internal class KioskActivity : ComponentActivity() {
             visibility = View.GONE
         }
         root.addView(consent, LinearLayout.LayoutParams(-1, -2))
-        enroll = button("Capture enrollment") { beginEnrollment() }
+        enroll = button("Capture enrollment") {
+            if (::config.isInitialized && config.mode == Mode.KIOSK) openSelfServiceEnrollment() else beginEnrollment()
+        }
         retry = button("Retry pending punch") { retryPunch() }
         selfTest = button("Test camera") { beginDiagnostic() }
         returnToSetup = button("Back to device setup") {
@@ -539,17 +699,429 @@ internal class KioskActivity : ComponentActivity() {
         }
     }
 
+    private fun openSelfServiceEnrollment() {
+        if (config.mode != Mode.KIOSK || !usable || !visible || busy || pending != null) return
+        if (cancellationRequested || enrollmentReference != null || enrollmentUi == EnrollmentUi.RECOVERING) {
+            retryEnrollmentRecovery()
+            return
+        }
+        activeEnrollmentClaim = null
+        selfCodeInput.setText("")
+        enrollmentUi = EnrollmentUi.ENTRY
+        viewfinder.visibility = View.GONE
+        message("Enter the six-digit code from the employee’s Attendance app.")
+        selfCodeInput.requestFocus()
+    }
+
+    private fun continueSelfServiceEnrollment() {
+        if (config.mode != Mode.KIOSK || enrollmentUi != EnrollmentUi.ENTRY || busy || pending != null || cancellationRequested) return
+        val code = selfCodeInput.text.toString()
+        if (!EnrollmentPolicy.validCode(code)) {
+            message("Enter all six digits, including any zeroes at the beginning.")
+            return
+        }
+        val reference = EnrollmentReference(UUID.randomUUID().toString(), null)
+        try {
+            enrollmentStore.write(reference)
+        } catch (_: Exception) {
+            message("Enrollment recovery could not be saved. Try again before claiming the code.")
+            return
+        }
+        enrollmentReference = reference
+        ephemeralEnrollmentCode = code
+        selfCodeInput.setText("")
+        enrollmentUi = EnrollmentUi.CLAIMING
+        val currentFlow = startFlow("Checking code…")
+        network.execute {
+            try {
+                play.prepare()
+                val claim = api.claimEnrollment(reference.claimRequestId, code)
+                acceptEnrollmentClaim(claim, currentFlow)
+            } catch (failure: Exception) {
+                if (failure is ApiRejected && failure.code == "KIOSK_ENROLLMENT_REJECTED") {
+                    if (cancellationRequested || flow != currentFlow) return@execute
+                    runCatching { enrollmentStore.clear() }
+                    onScreen {
+                        enrollmentReference = null
+                        ephemeralEnrollmentCode = null
+                        activeEnrollmentClaim = null
+                        cancellationRequested = false
+                        clearGuideIdentity()
+                        enrollmentUi = EnrollmentUi.ENTRY
+                        finishEnrollmentFlow("This code didn’t work. Check the six digits and your site, or get a new code in Attendance.")
+                    }
+                } else {
+                    resolveClaimFailure(reference, failure)
+                }
+            }
+        }
+    }
+
+    private fun acceptEnrollmentClaim(claim: EnrollmentClaim, currentFlow: Int? = null) {
+        val reference = EnrollmentReference(claim.claimRequestId, claim.sessionId)
+        enrollmentStore.write(reference)
+        enrollmentReference = reference
+        ephemeralEnrollmentCode = null
+        activeEnrollmentClaim = claim
+        onScreen {
+            if (!visible) {
+                requestEnrollmentCancellation("Enrollment was cancelled when the screen left the kiosk.")
+            } else if (currentFlow == null || flow == currentFlow) {
+                enrollmentUi = EnrollmentUi.GUIDE
+                enrollmentHeading.text = "Register your face for ${claim.employeeFirstName}"
+                enrollmentSite.text = "Site: ${claim.siteName}"
+                enrollmentNotice.text = "Notice · version ${claim.notice.version}\n\n${claim.notice.text}"
+                selfConsent.text = "I have read and agree to this notice (version ${claim.notice.version})."
+                selfConsent.isChecked = false
+                enrollmentInstruction.text = "Read the notice before agreeing to start the camera."
+                captureProgress.text = "One live check uses three accepted samples."
+                finishEnrollmentFlow("Code accepted. Review the notice and confirm only if you agree.")
+            }
+        }
+    }
+
+    private fun resolveClaimFailure(reference: EnrollmentReference, failure: Exception) {
+        try {
+            val recovered = api.enrollmentStatus(reference)
+            val fallback = if (failure is ApiRejected && failure.code == "KIOSK_ENROLLMENT_RATE_LIMIT") {
+                "Too many code attempts. ${failure.waitSeconds?.let { "Wait $it seconds, then retry status." } ?: "Wait before trying again."}"
+            } else "Checking registration…"
+            handleEnrollmentStatus(reference, recovered, startup = false, fallbackMessage = fallback)
+        } catch (_: Exception) {
+            onScreen {
+                enrollmentUi = EnrollmentUi.RECOVERING
+                recoveryText.text = "Checking registration… The result is not confirmed yet. Do not enter another code or retry capture."
+                finishEnrollmentFlow("Checking registration…")
+            }
+        }
+    }
+
+    private fun retryEnrollmentRecovery() {
+        val reference = enrollmentReference ?: return
+        recoverEnrollmentStatus(reference, startup = false)
+    }
+
+    private fun recoverEnrollmentStatus(reference: EnrollmentReference, startup: Boolean) {
+        enrollmentUi = EnrollmentUi.RECOVERING
+        recoveryText.text = "Checking registration…"
+        render()
+        network.execute {
+            try {
+                val status = api.enrollmentStatus(reference)
+                handleEnrollmentStatus(reference, status, startup, "Checking registration…")
+            } catch (_: Exception) {
+                onScreen {
+                    enrollmentUi = EnrollmentUi.RECOVERING
+                    recoveryText.text = "Checking registration… The result is not confirmed yet. Do not start another capture."
+                    message("Checking registration…")
+                }
+            }
+        }
+    }
+
+    private fun handleEnrollmentStatus(
+        reference: EnrollmentReference,
+        result: EnrollmentStatus,
+        startup: Boolean,
+        fallbackMessage: String,
+    ) {
+        when (result.state) {
+            "completed" -> {
+                enrollmentStore.clear()
+                enrollmentReference = null
+                ephemeralEnrollmentCode = null
+                cancellationRequested = false
+                val name = result.employeeFirstName ?: activeEnrollmentClaim?.employeeFirstName ?: recoveredEmployeeName
+                val site = result.siteName ?: activeEnrollmentClaim?.siteName ?: recoveredSiteName
+                onScreen { showEnrollmentSuccess(name, site) }
+            }
+            "claimed" -> {
+                val sessionId = result.sessionId ?: reference.sessionId
+                if (sessionId == null) {
+                    onScreen {
+                        enrollmentUi = EnrollmentUi.RECOVERING
+                        recoveryText.text = "The claim is still being checked. Do not capture again."
+                        message("Checking registration…")
+                    }
+                    return
+                }
+                val updated = EnrollmentReference(reference.claimRequestId, sessionId)
+                enrollmentStore.write(updated)
+                enrollmentReference = updated
+                val knownClaim = activeEnrollmentClaim?.takeIf {
+                    it.claimRequestId == updated.claimRequestId && it.sessionId == sessionId && Instant.now().isBefore(it.captureExpiresAt)
+                }
+                if (knownClaim != null) {
+                    onScreen {
+                        activeEnrollmentClaim = knownClaim
+                        enrollmentUi = EnrollmentUi.GUIDE
+                        enrollmentHeading.text = "Register your face for ${knownClaim.employeeFirstName}"
+                        enrollmentSite.text = "Site: ${knownClaim.siteName}"
+                        enrollmentNotice.text = "Notice · version ${knownClaim.notice.version}\n\n${knownClaim.notice.text}"
+                        selfConsent.text = "I have read and agree to this notice (version ${knownClaim.notice.version})."
+                        selfConsent.isChecked = false
+                        enrollmentInstruction.text = "Read the notice before agreeing to start the camera."
+                        finishEnrollmentFlow(fallbackMessage)
+                    }
+                    return
+                }
+                val code = ephemeralEnrollmentCode
+                if (code != null) {
+                    try {
+                        acceptEnrollmentClaim(api.claimEnrollment(updated.claimRequestId, code))
+                    } catch (_: Exception) {
+                        ephemeralEnrollmentCode = null
+                        cancelClaimAndResolve(updated, "The claim could not be restored. Ask the employee to get a new code in Attendance.")
+                    }
+                } else {
+                    // Status omits the approved notice, so a recovered claim without in-memory claim details is cancelled.
+                    cancelClaimAndResolve(updated, "The saved claim was recovered. Ask the employee to get a new code in Attendance.")
+                }
+            }
+            "issued", "expired", "cancelled", "superseded", "not_found" -> {
+                if (cancellationRequested && !startup) return
+                enrollmentStore.clear()
+                enrollmentReference = null
+                ephemeralEnrollmentCode = null
+                activeEnrollmentClaim = null
+                cancellationRequested = false
+                onScreen {
+                    clearGuideIdentity()
+                    if (startup && pending != null) {
+                        enrollmentUi = EnrollmentUi.IDLE
+                        message("A punch is awaiting confirmation. Retry to read its receipt.")
+                    } else {
+                        enrollmentUi = if (startup) EnrollmentUi.IDLE else EnrollmentUi.ENTRY
+                        selfCodeInput.setText("")
+                        finishEnrollmentFlow(if (result.state == "cancelled" || result.state == "expired" || result.state == "superseded")
+                            "Enrollment did not complete. Get a new code in Attendance to start again."
+                        else fallbackMessage)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun cancelClaimAndResolve(reference: EnrollmentReference, messageAfter: String) {
+        activeEnrollmentClaim = null
+        ephemeralEnrollmentCode = null
+        recoveredEmployeeName = null
+        recoveredSiteName = null
+        cancellationRequested = true
+        busy = false
+        flow += 1
+        onScreen { clearGuideIdentity() }
+        try {
+            api.cancelEnrollment(reference)
+            val status = api.enrollmentStatus(reference)
+            if (status.state in setOf("cancelled", "expired", "superseded", "not_found", "issued")) {
+                enrollmentStore.clear()
+                enrollmentReference = null
+                activeEnrollmentClaim = null
+                ephemeralEnrollmentCode = null
+                cancellationRequested = false
+                onScreen {
+                    enrollmentUi = if (visible) EnrollmentUi.ENTRY else EnrollmentUi.IDLE
+                    selfCodeInput.setText("")
+                    finishEnrollmentFlow(messageAfter)
+                }
+            } else if (status.state == "completed") {
+                handleEnrollmentStatus(reference, status, startup = false, fallbackMessage = messageAfter)
+            } else {
+                onScreen {
+                    enrollmentUi = EnrollmentUi.RECOVERING
+                    recoveryText.text = "Cancellation is still being confirmed. Do not capture again."
+                    finishEnrollmentFlow("Checking registration…")
+                }
+            }
+        } catch (_: Exception) {
+            onScreen {
+                    enrollmentUi = EnrollmentUi.RECOVERING
+                    recoveryText.text = "Cancellation could not be confirmed. Check registration status before continuing."
+                    finishEnrollmentFlow("Checking registration…")
+            }
+        }
+    }
+
+    private fun cancelSelfServiceEnrollment() {
+        selfCodeInput.setText("")
+        activeCapture.set(null)
+        ephemeralEnrollmentCode = null
+        val reference = enrollmentReference
+        if (reference == null) {
+            activeEnrollmentClaim = null
+            cancellationRequested = false
+            clearGuideIdentity()
+            enrollmentUi = EnrollmentUi.IDLE
+            viewfinder.visibility = View.VISIBLE
+            message("Enrollment cancelled. Select an action or set up biometric.")
+        } else {
+            requestEnrollmentCancellation("Enrollment cancelled. Get a new code in Attendance to start again.")
+        }
+    }
+
+    private fun requestEnrollmentCancellation(messageAfter: String) {
+        val reference = enrollmentReference ?: run {
+            onScreen { activeEnrollmentClaim = null; enrollmentUi = EnrollmentUi.IDLE; message(messageAfter) }
+            return
+        }
+        activeCapture.set(null)
+        ephemeralEnrollmentCode = null
+        activeEnrollmentClaim = null
+        recoveredEmployeeName = null
+        recoveredSiteName = null
+        clearGuideIdentity()
+        cancellationRequested = true
+        busy = false
+        flow += 1
+        enrollmentUi = EnrollmentUi.RECOVERING
+        recoveryText.text = "Checking registration…"
+        render()
+        network.execute {
+            try {
+                val status = api.enrollmentStatus(reference)
+                if (status.state == "completed") {
+                    handleEnrollmentStatus(reference, status, startup = false, fallbackMessage = messageAfter)
+                } else if (status.state == "claimed") {
+                    val sessionId = status.sessionId ?: reference.sessionId
+                    if (sessionId == null) error("Claim session is not available for cancellation")
+                    val updated = EnrollmentReference(reference.claimRequestId, sessionId)
+                    enrollmentStore.write(updated)
+                    enrollmentReference = updated
+                    cancelClaimAndResolve(updated, messageAfter)
+                } else if (status.state in setOf("issued", "expired", "cancelled", "superseded", "not_found")) {
+                    enrollmentStore.clear()
+                    enrollmentReference = null
+                    activeEnrollmentClaim = null
+                    cancellationRequested = false
+                    onScreen {
+                        enrollmentUi = EnrollmentUi.IDLE
+                        viewfinder.visibility = View.VISIBLE
+                        message(messageAfter)
+                    }
+                }
+            } catch (_: Exception) {
+                onScreen {
+                    enrollmentUi = EnrollmentUi.RECOVERING
+                    recoveryText.text = "Cancellation could not be confirmed. Check registration status before continuing."
+                    message("Checking registration…")
+                }
+            }
+        }
+    }
+
+    private fun startSelfServiceCapture() {
+        val claim = activeEnrollmentClaim ?: return
+        if (enrollmentUi != EnrollmentUi.GUIDE || pending != null || busy || cancellationRequested) return
+        if (claim.notice.version.isBlank() || claim.notice.text.isBlank()) {
+            message("The approved notice is unavailable. Enrollment cannot continue.")
+            cancelSelfServiceEnrollment()
+            return
+        }
+        if (!selfConsent.isChecked) {
+            message("Read the notice and check the agreement box before starting the camera.")
+            return
+        }
+        if (!Instant.now().isBefore(claim.captureExpiresAt)) {
+            requestEnrollmentCancellation("The enrollment session expired. Get a new code in Attendance to start again.")
+            return
+        }
+        if (!cameraReady) {
+            message("Allow camera access and wait for the front camera to be ready.")
+            startCamera()
+            return
+        }
+        val currentFlow = startFlow("Look at the front camera. Keep one face centered.")
+        enrollmentUi = EnrollmentUi.CAPTURING
+        enrollmentInstruction.text = "Look at the front camera and keep one face centered."
+        captureProgress.text = "0 of 3 live samples accepted."
+        render()
+        startCapture(currentFlow, CapturePurpose.SelfServiceEnrollment(claim))
+    }
+
+    private fun showEnrollmentSuccess(employeeName: String?, siteName: String?) {
+        activeCapture.set(null)
+        activeEnrollmentClaim = null
+        ephemeralEnrollmentCode = null
+        selfCodeInput.setText("")
+        recoveredEmployeeName = employeeName
+        recoveredSiteName = siteName
+        clearGuideIdentity()
+        successText.text = listOfNotNull("Face registered", employeeName, siteName).joinToString(" · ")
+        enrollmentUi = EnrollmentUi.SUCCESS
+        if (pending == null) {
+            busy = false
+            message("Face registered. Registration was confirmed by the server.")
+        } else message("A punch is awaiting confirmation. Retry to read its receipt.")
+    }
+
+    private fun beginCheckInAfterEnrollment() {
+        if (pending != null) {
+            message("Retry the pending punch before starting another check-in.")
+            return
+        }
+        activeEnrollmentClaim = null
+        recoveredEmployeeName = null
+        recoveredSiteName = null
+        clearGuideIdentity()
+        successText.text = ""
+        enrollmentUi = EnrollmentUi.IDLE
+        render()
+        begin(Action.IN)
+    }
+
+    private fun finishSelfServiceEnrollment() {
+        activeCapture.set(null)
+        selfCodeInput.setText("")
+        selfConsent.isChecked = false
+        clearGuideIdentity()
+        successText.text = ""
+        activeEnrollmentClaim = null
+        recoveredEmployeeName = null
+        recoveredSiteName = null
+        enrollmentUi = EnrollmentUi.IDLE
+        viewfinder.visibility = View.VISIBLE
+        message("Select an action or set up biometric.")
+    }
+
+    private fun clearGuideIdentity() {
+        enrollmentHeading.text = ""
+        enrollmentSite.text = ""
+        enrollmentNotice.text = ""
+        selfConsent.text = ""
+        selfConsent.isChecked = false
+        enrollmentInstruction.text = ""
+        captureProgress.text = ""
+    }
+
     private fun startCapture(currentFlow: Int, purpose: CapturePurpose) {
         if (flow != currentFlow) return
         if (!visible) {
-            finishFlow("Camera capture stopped. Select an action to try again.")
+            if (purpose is CapturePurpose.SelfServiceEnrollment) {
+                requestEnrollmentCancellation("Enrollment was cancelled when the screen left the kiosk.")
+            } else finishFlow("Camera capture stopped. Select an action to try again.")
             return
         }
-        val capture = FaceCapture(purpose)
+        val capture = FaceCapture(purpose) { accepted ->
+            if (purpose is CapturePurpose.SelfServiceEnrollment) onScreen {
+                val progress = "$accepted of 3 live samples accepted."
+                captureProgress.text = progress
+                enrollmentInstruction.text = when (accepted) {
+                    1 -> "First sample accepted. Keep your face centered for the next sample."
+                    2 -> "Second sample accepted. Hold still for the final sample."
+                    else -> "All three samples accepted. Saving registration…"
+                }
+                captureProgress.announceForAccessibility(progress)
+            }
+        }
         activeCapture.set(capture)
         message("Look at the front camera and keep your face centered.")
         main.postDelayed({
-            if (activeCapture.compareAndSet(capture, null)) finishFlow("Face capture timed out. Try again.")
+            if (activeCapture.compareAndSet(capture, null)) {
+                if (purpose is CapturePurpose.SelfServiceEnrollment) {
+                    requestEnrollmentCancellation("Face capture timed out. Get a new code in Attendance to start again.")
+                } else finishFlow("Face capture timed out. Try again.")
+            }
         }, 9000)
     }
 
@@ -563,9 +1135,28 @@ internal class KioskActivity : ComponentActivity() {
                 else finishFlow("Camera capture stopped. Select an action to try again.")
             }
         } catch (rejected: CaptureRejected) {
-            if (capture != null && activeCapture.compareAndSet(capture, null)) onScreen { finishFlow(rejected.displayMessage) }
+            if (capture != null && activeCapture.compareAndSet(capture, null)) onScreen {
+                if (capture.purpose is CapturePurpose.SelfServiceEnrollment) {
+                    if (rejected.displayMessage.contains("timed out", ignoreCase = true)) {
+                        requestEnrollmentCancellation("Face capture timed out. Get a new code in Attendance to start again.")
+                    } else {
+                        enrollmentUi = EnrollmentUi.GUIDE
+                        selfConsent.isChecked = false
+                        enrollmentInstruction.text = rejected.displayMessage
+                        captureProgress.text = "Capture stopped. Read the notice and agree again to retry."
+                        finishFlow(rejected.displayMessage)
+                    }
+                } else finishFlow(rejected.displayMessage)
+            }
         } catch (_: Exception) {
-            if (capture != null && activeCapture.compareAndSet(capture, null)) onScreen { finishFlow("Camera verification failed. Try again.") }
+            if (capture != null && activeCapture.compareAndSet(capture, null)) onScreen {
+                if (capture.purpose is CapturePurpose.SelfServiceEnrollment) {
+                    enrollmentUi = EnrollmentUi.GUIDE
+                    selfConsent.isChecked = false
+                    enrollmentInstruction.text = "Camera verification failed. Read the notice and agree again to retry."
+                    finishFlow("Camera verification failed. Read the notice and agree to try again.")
+                } else finishFlow("Camera verification failed. Try again.")
+            }
         } finally {
             image.close()
         }
@@ -576,8 +1167,14 @@ internal class KioskActivity : ComponentActivity() {
             finishFlow("Live-face camera self-test passed. Nothing was recorded or sent.")
             return
         }
+        if (purpose is CapturePurpose.SelfServiceEnrollment && !selfConsent.isChecked) {
+            enrollmentUi = EnrollmentUi.GUIDE
+            finishFlow("Agreement was withdrawn. Read the notice and agree before trying again.")
+            return
+        }
         val currentFlow = flow
-        message("Confirming with attendance…")
+        if (purpose is CapturePurpose.SelfServiceEnrollment) enrollmentUi = EnrollmentUi.SAVING
+        message(if (purpose is CapturePurpose.SelfServiceEnrollment) "Saving registration…" else "Confirming with attendance…")
         submit(currentFlow) {
             when (purpose) {
                 is CapturePurpose.Punch -> {
@@ -593,7 +1190,34 @@ internal class KioskActivity : ComponentActivity() {
                         finishFlow("Face enrollment saved.")
                     }
                 }
+                is CapturePurpose.SelfServiceEnrollment -> saveSelfServiceEnrollment(purpose.claim, result)
                 is CapturePurpose.Diagnostic -> Unit
+            }
+        }
+    }
+
+    private fun saveSelfServiceEnrollment(claim: EnrollmentClaim, result: CaptureResult) {
+        val reference = enrollmentReference ?: return
+        enrollmentUi = EnrollmentUi.SAVING
+        try {
+            api.completeEnrollment(claim, consented = true, embedding = checkNotNull(result.embedding), frames = result.frames)
+        } catch (_: Exception) {
+            // Resolve the durable server state below before allowing any new capture.
+        }
+        onScreen {
+            enrollmentUi = EnrollmentUi.RECOVERING
+            recoveryText.text = "Checking registration…"
+            message("Checking registration…")
+        }
+        try {
+            val status = api.enrollmentStatus(reference)
+            handleEnrollmentStatus(reference, status, startup = false,
+                fallbackMessage = "Registration was not confirmed. Review the notice and agree before trying again.")
+        } catch (_: Exception) {
+            onScreen {
+                enrollmentUi = EnrollmentUi.RECOVERING
+                recoveryText.text = "Checking registration… The save result is not confirmed. Do not capture again."
+                message("Checking registration…")
             }
         }
     }
@@ -652,6 +1276,11 @@ internal class KioskActivity : ComponentActivity() {
         message(value)
     }
 
+    private fun finishEnrollmentFlow(value: String) {
+        if (pending != null) message("A punch is awaiting confirmation. Retry to read its receipt.")
+        else finishFlow(value)
+    }
+
     private fun message(value: String) {
         status.text = value
         render()
@@ -659,14 +1288,35 @@ internal class KioskActivity : ComponentActivity() {
 
     private fun render() {
         val mode = if (::config.isInitialized) config.mode else null
-        actions.visibility = if (mode == Mode.KIOSK && pending == null) View.VISIBLE else View.GONE
-        enroll.visibility = if (mode == Mode.ENROLL && pending == null) View.VISIBLE else View.GONE
+        val selfService = mode == Mode.KIOSK && !localTestMode
+        val idle = enrollmentUi == EnrollmentUi.IDLE
+        actions.visibility = if (mode == Mode.KIOSK && pending == null && idle) View.VISIBLE else View.GONE
+        enroll.text = if (mode == Mode.KIOSK) "Set up biometric" else "Capture enrollment"
+        enroll.visibility = if (((mode == Mode.ENROLL) || (selfService && idle)) && pending == null) View.VISIBLE else View.GONE
         consent.visibility = if (mode == Mode.ENROLL) View.VISIBLE else View.GONE
         retry.visibility = if (pending != null) View.VISIBLE else View.GONE
-        selfTest.visibility = if (mode == Mode.KIOSK || localTestMode) View.VISIBLE else View.GONE
+        selfTest.visibility = if ((mode == Mode.KIOSK && idle) || localTestMode) View.VISIBLE else View.GONE
         returnToSetup.visibility = if (localTestMode && firstRunPanel != null) View.VISIBLE else View.GONE
-        admin.visibility = if (LocalDeviceSetup.isConfigured(this)) View.VISIBLE else View.GONE
-        val available = usable && cameraReady && !busy && pending == null
+        admin.visibility = if (LocalDeviceSetup.isConfigured(this) && idle) View.VISIBLE else View.GONE
+        enrollmentEntry.visibility = if (selfService && enrollmentUi in setOf(EnrollmentUi.ENTRY, EnrollmentUi.CLAIMING)) View.VISIBLE else View.GONE
+        val showGuide = selfService && enrollmentUi in setOf(EnrollmentUi.GUIDE, EnrollmentUi.CAPTURING, EnrollmentUi.SAVING)
+        enrollmentGuide.visibility = if (showGuide) View.VISIBLE else View.GONE
+        enrollmentGuideScroll.visibility = if (showGuide) View.VISIBLE else View.GONE
+        enrollmentRecovery.visibility = if (selfService && enrollmentUi == EnrollmentUi.RECOVERING) View.VISIBLE else View.GONE
+        enrollmentSuccess.visibility = if (selfService && enrollmentUi == EnrollmentUi.SUCCESS && pending == null) View.VISIBLE else View.GONE
+        cancelEnrollmentButton.isEnabled = enrollmentUi == EnrollmentUi.ENTRY || enrollmentUi == EnrollmentUi.CLAIMING
+        continueEnrollment.isEnabled = !busy && !cancellationRequested && EnrollmentPolicy.validCode(selfCodeInput.text.toString())
+        startEnrollmentCapture.isEnabled = !busy && !cancellationRequested && cameraReady && selfConsent.isChecked && activeEnrollmentClaim != null
+        selfConsent.isEnabled = enrollmentUi == EnrollmentUi.GUIDE && !busy && activeEnrollmentClaim != null
+        retryEnrollmentStatus.isEnabled = !busy
+        cancelRecoveredEnrollment.visibility = if (enrollmentReference?.sessionId != null) View.VISIBLE else View.GONE
+        cancelRecoveredEnrollment.isEnabled = !busy
+        checkInAfterEnrollment.isEnabled = !busy && usable && cameraReady && pending == null
+        finishEnrollment.isEnabled = !busy
+        if (selfService) {
+            viewfinder.visibility = if (enrollmentUi == EnrollmentUi.IDLE || enrollmentUi == EnrollmentUi.CAPTURING) View.VISIBLE else View.GONE
+        }
+        val available = usable && cameraReady && !busy && pending == null && (idle || localTestMode)
         checkIn.isEnabled = available
         checkOut.isEnabled = available
         enroll.isEnabled = available

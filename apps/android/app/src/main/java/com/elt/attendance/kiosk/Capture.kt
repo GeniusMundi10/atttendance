@@ -9,11 +9,12 @@ import kotlin.math.roundToInt
 internal sealed interface CapturePurpose {
     data class Punch(val action: Action, val challenge: Challenge, val roster: List<Template>) : CapturePurpose
     data class Enrollment(val employeeId: String, val code: String) : CapturePurpose
+    data class SelfServiceEnrollment(val claim: EnrollmentClaim) : CapturePurpose
     data object Diagnostic : CapturePurpose
 }
 internal data class CaptureResult(val frames: JSONArray, val template: Template?, val embedding: JSONArray?)
 
-internal class FaceCapture(val purpose: CapturePurpose) {
+internal class FaceCapture(val purpose: CapturePurpose, private val onSampleAccepted: (Int) -> Unit = {}) {
     private val started = SystemClock.elapsedRealtimeNanos()
     private val frames = mutableListOf<JSONArray>()
     private val samples = mutableListOf<FloatArray>()
@@ -57,8 +58,9 @@ internal class FaceCapture(val purpose: CapturePurpose) {
         previous = elapsed
         frames += JSONArray(listOf(elapsed.toInt(), sample.liveness, score, margin))
         samples += sample.embedding
+        onSampleAccepted(frames.size)
         if (frames.size < 3) return null
-        val embedding = if (purpose is CapturePurpose.Enrollment) {
+        val embedding = if (purpose is CapturePurpose.Enrollment || purpose is CapturePurpose.SelfServiceEnrollment) {
             val average = normalized(FloatArray(128) { coordinate -> samples.sumOf { it[coordinate].toDouble() }.toFloat() })
             JSONArray(average.map { (it * 10000).roundToInt() })
         } else null

@@ -7,8 +7,10 @@ import { fileURLToPath } from 'node:url';
 import {
   AccessDeniedError,
   AccessMfaRequiredError,
+  authorizeFaceRegistrationReset,
   authorizeReceiptRead,
   checkKioskEligibility,
+  listActiveSiteAssignments,
   listReadableEmployees,
   resolveAuthenticatedSubject,
 } from './access.ts';
@@ -57,6 +59,21 @@ test('active operator role requires trusted aal2 even for own receipt access', a
   );
 });
 
+test('face reset authorization rejects non-HR actors', async () => {
+  const actorId = randomUUID();
+  const client = {
+    async query(sql: string) {
+      if (sql.includes('access_subject_links')) return { rows: [{ employee_id: actorId, operator_role: null }] };
+      if (sql.includes('access_operator_roles role')) return { rows: [] };
+      throw new Error('Unexpected access query');
+    },
+  } as unknown as QueryClient;
+  await assert.rejects(authorizeFaceRegistrationReset(client, {
+    actor: { employeeId: actorId, authProvider: 'issuer', authSubject: 'subject', aal: 'aal2' },
+    employeeId: randomUUID(),
+  }), AccessDeniedError);
+});
+
 test('access decisions use active mapping and database reader scope', {
   skip: !process.env.ACCESS_TEST_DATABASE_URL && 'Set ACCESS_TEST_DATABASE_URL for PostgreSQL test',
 }, async () => {
@@ -88,6 +105,7 @@ test('access decisions use active mapping and database reader scope', {
 
     await client.query('BEGIN');
     await checkKioskEligibility(client, { employeeId: employee, siteId: site });
+    assert.deepEqual(await listActiveSiteAssignments(client, employee), [{ siteId: site, siteName: 'Site' }]);
     await client.query('COMMIT');
     await assert.rejects(checkKioskEligibility(client, { employeeId: employee, siteId: otherSite }), AccessDeniedError);
 
@@ -97,6 +115,9 @@ test('access decisions use active mapping and database reader scope', {
     await assert.rejects(resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: hr }), AccessMfaRequiredError);
     await assert.rejects(resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: hr, aal: 'aal1' }), AccessMfaRequiredError);
     const hrActor = await resolveAuthenticatedSubject(client, { authProvider: provider, authSubject: hr, aal: 'aal2' });
+    await authorizeFaceRegistrationReset(client, { actor: hrActor, employeeId: employee });
+    await assert.rejects(authorizeFaceRegistrationReset(client, { actor: managerActor, employeeId: employee }), AccessDeniedError);
+    await assert.rejects(authorizeFaceRegistrationReset(client, { actor: { ...hrActor, aal: 'aal1' }, employeeId: employee }), AccessMfaRequiredError);
     await authorizeReceiptRead(client, { actor: employeeActor, employeeId: employee });
     await authorizeReceiptRead(client, { actor: managerActor, employeeId: employee });
     await authorizeReceiptRead(client, { actor: hrActor, employeeId: employee });

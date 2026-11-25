@@ -16,18 +16,13 @@ type Db = {
 };
 type Device = { deviceId: string; siteId: string; publicKey: string };
 
-const activeEnrollment = `
-  JOIN access_employee_sites assignment
-    ON assignment.employee_id = template.employee_id AND assignment.site_id = template.site_id AND assignment.active
-  JOIN access_employees employee ON employee.id = template.employee_id AND employee.active`;
-
 async function registeredDevice(tx: Db, deviceId: string, exclusive = false): Promise<Device> {
   const { rows } = await tx.query(`
     SELECT device.site_id, device.public_key
     FROM kiosk_biometric_devices device
     JOIN access_sites site ON site.id = device.site_id AND site.active
     WHERE device.device_id = $1 AND device.active
-    FOR ${exclusive ? "UPDATE" : "SHARE"} OF device
+    FOR ${exclusive ? "UPDATE" : "SHARE"} OF device, site
   `, [deviceId]);
   const row = rows[0];
   if (!row || typeof row.site_id !== "string" || typeof row.public_key !== "string") {
@@ -118,9 +113,15 @@ export async function verifyEvidence(tx: Db, input: unknown) {
   if (!(issuedAt instanceof Date)) throw new BiometricsError("INVALID_KIOSK_CHALLENGE", 409);
 
   const template = await tx.query(`
-    SELECT 1 FROM kiosk_face_templates template ${activeEnrollment}
-    WHERE template.template_id = $1 AND template.employee_id = $2 AND template.site_id = $3
-    FOR SHARE OF template
+    SELECT 1 FROM kiosk_face_templates template
+    JOIN kiosk_face_registrations registration
+      ON registration.employee_id = template.employee_id AND registration.template_id = template.template_id
+    JOIN access_employee_sites assignment
+      ON assignment.employee_id = template.employee_id AND assignment.site_id = $3 AND assignment.active
+    JOIN access_sites site ON site.id = assignment.site_id AND site.active
+    JOIN access_employees employee ON employee.id = template.employee_id AND employee.active
+    WHERE template.template_id = $1 AND template.employee_id = $2 AND template.retired_at IS NULL
+    FOR SHARE OF template, registration, assignment, employee, site
   `, [templateId, employeeId, device.siteId]);
   if (!template.rows.length) throw new BiometricsError("BIOMETRIC_VERIFICATION_FAILED", 403);
 
@@ -167,17 +168,24 @@ export async function fetchRoster(tx: Db, input: unknown, header: unknown) {
   await useProof(tx, deviceId, signed);
   const key = templateKey();
   const { rows } = await tx.query(`
-    SELECT template.template_id, template.employee_id, employee.display_name, template.sealed_embedding
-    FROM kiosk_face_templates template ${activeEnrollment}
-    WHERE template.site_id = $1
+    SELECT template.template_id, template.site_id AS template_site_id, template.employee_id, employee.display_name, template.sealed_embedding
+    FROM kiosk_face_templates template
+    JOIN kiosk_face_registrations registration
+      ON registration.employee_id = template.employee_id AND registration.template_id = template.template_id
+    JOIN access_employee_sites assignment
+      ON assignment.employee_id = template.employee_id AND assignment.site_id = $1 AND assignment.active
+    JOIN access_sites site ON site.id = assignment.site_id AND site.active
+    JOIN access_employees employee ON employee.id = template.employee_id AND employee.active
+    WHERE template.retired_at IS NULL
     ORDER BY template.employee_id
+    FOR SHARE OF template, registration, assignment, site, employee
   `, [device.siteId]);
   return {
     templates: rows.map(row => ({
       employeeId: row.employee_id as string,
       displayName: row.display_name as string,
       templateId: row.template_id as string,
-      embedding: decryptEmbedding(row.sealed_embedding as string, `${device.siteId}/${row.employee_id}/${row.template_id}`, key),
+      embedding: decryptEmbedding(row.sealed_embedding as string, `${row.template_site_id}/${row.employee_id}/${row.template_id}`, key),
     })),
   };
 }
@@ -192,6 +200,11 @@ export async function enrollFace(tx: Db, input: unknown) {
   checkSequence(frames, false);
   await useProof(tx, deviceId, request);
   const key = templateKey();
+
+  await tx.query(`INSERT INTO kiosk_face_registrations(employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING`, [employeeId]);
+  const registration = await tx.query(`SELECT registration_revision,template_id FROM kiosk_face_registrations WHERE employee_id = $1 FOR UPDATE`, [employeeId]);
+  if (!registration.rows[0] || registration.rows[0].template_id) throw new BiometricsError("FACE_ALREADY_REGISTERED", 409);
+  const revision = Number(registration.rows[0].registration_revision);
 
   const code = await tx.query(`
     DELETE FROM kiosk_face_enrollment_codes
@@ -211,11 +224,39 @@ export async function enrollFace(tx: Db, input: unknown) {
 
   const templateId = randomUUID();
   const sealed = encryptEmbedding(embedding, `${device.siteId}/${employeeId}/${templateId}`, key);
-  await tx.query(`
+  const inserted = await tx.query(`
     INSERT INTO kiosk_face_templates(template_id, site_id, employee_id, sealed_embedding)
     VALUES ($1, $2, $3, $4)
-    ON CONFLICT (site_id, employee_id)
-    DO UPDATE SET template_id = EXCLUDED.template_id, sealed_embedding = EXCLUDED.sealed_embedding
+    ON CONFLICT DO NOTHING
+    RETURNING template_id
   `, [templateId, device.siteId, employeeId, sealed]);
+  if (inserted.rowCount !== 1) throw new BiometricsError("FACE_ALREADY_REGISTERED", 409);
+  const linked = await tx.query(`
+    UPDATE kiosk_face_registrations SET template_id = $2,registered_at = clock_timestamp(),updated_at = clock_timestamp()
+     WHERE employee_id = $1 AND registration_revision = $3 AND template_id IS NULL
+  `, [employeeId, templateId, revision]);
+  if (linked.rowCount !== 1) throw new BiometricsError("FACE_REGISTRATION_CONFLICT", 409);
   return { employeeId, templateId };
 }
+
+export {
+  cancelFaceEnrollment,
+  claimFaceEnrollment,
+  completeFaceEnrollment,
+  generateEnrollmentCode,
+  getFaceEnrollmentSessionStatus,
+  getFaceEnrollmentStatus,
+  issueFaceEnrollmentCode,
+  resetFaceRegistration,
+  siteScopedEnrollmentDigest,
+} from "./self-service.ts";
+export type {
+  ClaimEnrollmentInput,
+  ClaimEnrollmentResult,
+  CompleteEnrollmentInput,
+  EnrollmentSessionStatus,
+  FaceEnrollmentStatus,
+  IssueEnrollmentResult,
+  IssuedEnrollmentCode,
+  ResetFaceRegistrationInput,
+} from "./self-service.ts";

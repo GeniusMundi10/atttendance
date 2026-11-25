@@ -36,7 +36,8 @@ export async function migrate(pool: Pool, root = resolve('features')) {
         FOREACH t IN ARRAY ARRAY['elt_schema_migrations','access_employees','access_sites',
           'access_employee_sites','access_subject_links','access_operator_roles','access_manager_reports',
           'kiosk_biometric_devices','kiosk_biometric_requests','kiosk_biometric_challenges',
-          'kiosk_face_templates','kiosk_face_enrollment_codes','attendance_punches','attendance_audit','attendance_outbox',
+          'kiosk_face_templates','kiosk_face_enrollment_codes','kiosk_face_registrations','kiosk_face_enrollment_requests',
+          'kiosk_face_enrollment_limits','kiosk_face_registration_resets','attendance_punches','attendance_audit','attendance_outbox',
           'correction_requests','correction_days','leave_work_dates','leave_balances','leave_requests','leave_decisions',
           'schedule_shifts','schedule_holidays','schedule_assignments','schedule_audit']
         LOOP

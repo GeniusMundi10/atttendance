@@ -19,6 +19,11 @@ export interface Actor {
   aal?: string;
 }
 
+export interface ActiveSiteAssignment {
+  siteId: string;
+  siteName: string;
+}
+
 export class AccessDeniedError extends Error {
   constructor(message = 'Access denied') {
     super(message);
@@ -55,6 +60,23 @@ export async function checkKioskEligibility(
   if (result.rows.length !== 1) throw new AccessDeniedError('Employee is not active at this site');
 }
 
+/** Return active employee assignments to active sites for enrollment site selection. */
+export async function listActiveSiteAssignments(
+  client: QueryClient,
+  employeeId: string,
+): Promise<ActiveSiteAssignment[]> {
+  const result = await client.query<{ site_id: string; site_name: string }>(
+    `SELECT s.id AS site_id, s.name AS site_name
+       FROM access_employees e
+       JOIN access_employee_sites es ON es.employee_id = e.id AND es.active
+       JOIN access_sites s ON s.id = es.site_id AND s.active
+      WHERE e.id = $1 AND e.active
+      ORDER BY s.name, s.id`,
+    [employeeId],
+  );
+  return result.rows.map(row => ({ siteId: row.site_id, siteName: row.site_name }));
+}
+
 /** The caller must verify the token before passing its issuer, subject, and AAL. */
 export async function resolveAuthenticatedSubject(
   client: QueryClient,
@@ -69,7 +91,8 @@ export async function resolveAuthenticatedSubject(
        JOIN access_employees e ON e.id = l.employee_id
        LEFT JOIN access_operator_roles r ON r.employee_id = e.id AND r.active
       WHERE l.auth_provider = $1 AND l.auth_subject = $2
-        AND l.active AND e.active`,
+        AND l.active AND e.active
+      FOR SHARE OF l, e`,
     [subject.authProvider, subject.authSubject],
   );
   if (result.rows.length !== 1) throw new AccessDeniedError();
@@ -106,6 +129,26 @@ export async function authorizeReceiptRead(
              WHERE m.manager_id = $1 AND m.report_id = target.id AND m.active
           )
         )`,
+    [actor.employeeId, input.employeeId],
+  );
+  if (result.rows.length !== 1) throw new AccessDeniedError();
+}
+
+/** Verify a linked HR/ADMIN actor with trusted AAL2 before a biometric reset. */
+export async function authorizeFaceRegistrationReset(
+  client: QueryClient,
+  input: { actor: Actor; employeeId: string },
+): Promise<void> {
+  const actor = await resolveAuthenticatedSubject(client, input.actor);
+  if (actor.employeeId !== input.actor.employeeId || actor.aal !== 'aal2') {
+    throw new AccessDeniedError();
+  }
+  const result = await client.query(
+    `SELECT target.id
+       FROM access_employees target
+       JOIN access_operator_roles role ON role.employee_id = $1 AND role.active AND role.role IN ('HR', 'ADMIN')
+      WHERE target.id = $2
+      FOR SHARE OF target, role`,
     [actor.employeeId, input.employeeId],
   );
   if (result.rows.length !== 1) throw new AccessDeniedError();

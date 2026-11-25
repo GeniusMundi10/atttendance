@@ -114,7 +114,24 @@ internal class PlayProof(context: Context, private val cloudProject: Long) {
 internal data class Challenge(val challengeId: String, val nonce: String, val expiresAt: Instant)
 internal data class Template(val employeeId: String, val templateId: String, val feature: FloatArray, val displayName: String)
 internal data class Receipt(val action: Action, val recordedAt: Instant)
-internal class ApiRejected(val code: String) : IOException("Kiosk request rejected")
+internal data class EnrollmentNotice(val version: String, val text: String)
+internal data class EnrollmentClaim(
+    val claimRequestId: String,
+    val sessionId: String,
+    val employeeFirstName: String,
+    val siteName: String,
+    val registrationRevision: Int,
+    val notice: EnrollmentNotice,
+    val captureExpiresAt: Instant,
+)
+internal data class EnrollmentStatus(
+    val state: String,
+    val sessionId: String?,
+    val employeeFirstName: String?,
+    val siteName: String?,
+    val completedAt: Instant?,
+)
+internal class ApiRejected(val code: String, val waitSeconds: Int? = null) : IOException("Kiosk request rejected")
 
 internal class KioskApi(private val config: KioskConfig, private val signer: DeviceSigner, private val play: PlayProof) {
     private var cachedRoster: List<Template> = emptyList()
@@ -184,6 +201,76 @@ internal class KioskApi(private val config: KioskConfig, private val signer: Dev
         require(result.getString("employeeId") == employeeId && uuidPattern.matches(result.getString("templateId")))
     }
 
+    fun claimEnrollment(claimRequestId: String, code: String): EnrollmentClaim {
+        require(uuidPattern.matches(claimRequestId) && EnrollmentPolicy.validCode(code))
+        val body = JSONObject().put("deviceId", config.deviceId).put("requestId", claimRequestId).put("code", code)
+        val result = post("enrollment-claim", body,
+            proof("elt-enrollment-claim-v1", claimRequestId, code))
+        require(result.getString("state") == "claimed")
+        val responseClaimId = result.getString("claimRequestId")
+        val sessionId = result.getString("sessionId")
+        require(responseClaimId == claimRequestId && uuidPattern.matches(sessionId))
+        val noticeJson = result.getJSONObject("notice")
+        val notice = EnrollmentNotice(noticeJson.getString("version"), noticeJson.getString("text"))
+        require(notice.version.isNotBlank() && notice.version.length <= 100 && notice.text.isNotBlank() && notice.text.length <= 12000)
+        val firstName = result.getString("employeeFirstName").take(100)
+        val siteName = result.getString("siteName").take(160)
+        require(firstName.isNotBlank() && siteName.isNotBlank())
+        return EnrollmentClaim(claimRequestId, sessionId, firstName, siteName,
+            result.getInt("registrationRevision").also { require(it > 0) }, notice,
+            Instant.parse(result.getString("captureExpiresAt")))
+    }
+
+    fun completeEnrollment(
+        claim: EnrollmentClaim,
+        consented: Boolean,
+        embedding: JSONArray,
+        frames: JSONArray,
+    ) {
+        require(consented && embedding.length() == 128 && frames.length() == 3)
+        require(Instant.now().isBefore(claim.captureExpiresAt))
+        val requestId = UUID.randomUUID().toString()
+        val issuedAt = formatter.format(Instant.now())
+        val payload = canonical("elt-enrollment-complete-v1", config.deviceId, claim.claimRequestId, claim.sessionId,
+            requestId, issuedAt, claim.notice.version, true, embedding, frames)
+        val integrityToken = play.token(payload)
+        val body = JSONObject().put("deviceId", config.deviceId)
+            .put("claimRequestId", claim.claimRequestId).put("sessionId", claim.sessionId)
+            .put("requestId", requestId).put("issuedAt", issuedAt)
+            .put("consentVersion", claim.notice.version).put("consented", true)
+            .put("embedding", embedding).put("frames", frames)
+            .put("integrityToken", integrityToken)
+            .put("signature", signer.sign(canonical(payload, integrityToken)))
+        val result = post("enrollment-complete", body)
+        require(result.getString("state") == "completed")
+        result.optString("sessionId").takeIf { it.isNotEmpty() }?.let { require(it == claim.sessionId) }
+    }
+
+    fun enrollmentStatus(reference: EnrollmentReference): EnrollmentStatus {
+        require(uuidPattern.matches(reference.claimRequestId))
+        require(reference.sessionId == null || uuidPattern.matches(reference.sessionId))
+        val body = JSONObject().put("deviceId", config.deviceId).put("claimRequestId", reference.claimRequestId)
+        reference.sessionId?.let { body.put("sessionId", it) }
+        val signed = proof("elt-enrollment-status-v1", reference.claimRequestId, reference.sessionId.orEmpty())
+        val result = post("enrollment-status", body, signed)
+        val state = result.getString("state")
+        require(state in setOf("issued", "claimed", "completed", "expired", "cancelled", "superseded", "not_found"))
+        val sessionId = result.optString("sessionId").takeIf { it.isNotEmpty() }
+        require(sessionId == null || uuidPattern.matches(sessionId))
+        return EnrollmentStatus(state, sessionId,
+            result.optString("employeeFirstName").takeIf { it.isNotEmpty() }?.take(100),
+            result.optString("siteName").takeIf { it.isNotEmpty() }?.take(160),
+            result.optString("completedAt").takeIf { it.isNotEmpty() }?.let(Instant::parse))
+    }
+
+    fun cancelEnrollment(reference: EnrollmentReference) {
+        require(uuidPattern.matches(reference.claimRequestId) && reference.sessionId != null && uuidPattern.matches(reference.sessionId))
+        val body = JSONObject().put("deviceId", config.deviceId)
+            .put("claimRequestId", reference.claimRequestId).put("sessionId", reference.sessionId)
+        val signed = proof("elt-enrollment-cancel-v1", reference.claimRequestId, reference.sessionId)
+        post("enrollment-cancel", body, signed)
+    }
+
     private fun proof(kind: String, vararg arguments: String): String {
         val requestId = UUID.randomUUID().toString()
         val issuedAt = formatter.format(Instant.now())
@@ -212,9 +299,13 @@ internal class KioskApi(private val config: KioskConfig, private val signer: Dev
             val status = connection.responseCode
             if (status in 400..499) {
                 val error = connection.errorStream?.use { readBounded(it, 8192).toString(Charsets.UTF_8) }
-                val code = error?.let { runCatching { JSONObject(it).getString("error") }.getOrNull() }
+                val errorObject = error?.let { runCatching { JSONObject(it) }.getOrNull() }
+                val code = errorObject?.optString("error")?.takeIf { it.isNotEmpty() }
                 // Only a definitive application-level rejection can retire an unresolved request.
-                if (code != null && code.matches(Regex("[A-Za-z][A-Za-z0-9_]{2,80}"))) throw ApiRejected(code)
+                if (code != null && code.matches(Regex("[A-Za-z][A-Za-z0-9_]{2,80}"))) {
+                    val wait = errorObject?.optInt("waitSeconds")?.takeIf { it > 0 }
+                    throw ApiRejected(code, wait)
+                }
                 throw IOException("Kiosk server response was incomplete")
             }
             if (status !in 200..299) throw IOException("Kiosk server unavailable")
