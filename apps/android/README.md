@@ -12,7 +12,7 @@ Set-Location apps/android
 .\gradlew.bat :app:bundleRelease
 ```
 
-The release bundle needs the organization’s upload signing configuration and a Google Play release or testing track before a device can satisfy `PLAY_RECOGNIZED`. Enable Play Integrity for the app, link the Cloud project, enable the optional strong device integrity verdict, and provide the attendance server with the app signing certificate digest and authorized service account.
+Release packaging uses an ELT-owned upload keystore supplied through the process/CI environment variables `ELT_UPLOAD_KEYSTORE_FILE`, `ELT_UPLOAD_KEYSTORE_PASSWORD`, `ELT_UPLOAD_KEY_ALIAS`, and `ELT_UPLOAD_KEY_PASSWORD`. The `.env.example` entries are dummy placeholders: Gradle does not load that file. Keep the actual keystore outside the repository, provide passwords through a protected build environment, and never commit or print them. Release tasks fail closed when variables or the keystore file are missing. The release bundle needs an authorized Google Play testing/release track before a device can satisfy `PLAY_RECOGNIZED`. Enable Play Integrity for the app, link the Cloud project, enable the optional strong device integrity verdict, and provide the attendance server with the app signing certificate digest and authorized service account. Do not package the Play service-account credential in the app.
 
 ## Managed provisioning
 

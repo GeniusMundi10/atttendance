@@ -3,3 +3,8 @@
 .kotlin/
 **/build/
 local.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+keystore.properties

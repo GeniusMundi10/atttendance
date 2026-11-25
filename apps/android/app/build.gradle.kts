@@ -1,10 +1,34 @@
 // PURPOSE: Build the Android kiosk with checksum-verified face and liveness model assets.
 import java.net.URI
+import java.io.File
 import java.security.MessageDigest
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+}
+
+val uploadSigningNames = listOf(
+    "ELT_UPLOAD_KEYSTORE_FILE",
+    "ELT_UPLOAD_KEYSTORE_PASSWORD",
+    "ELT_UPLOAD_KEY_ALIAS",
+    "ELT_UPLOAD_KEY_PASSWORD",
+)
+val uploadSigningValues = uploadSigningNames.associateWith { providers.environmentVariable(it).orNull }
+val uploadSigningConfigured = uploadSigningValues.values.all { !it.isNullOrBlank() }
+val releaseArtifactRequested = gradle.startParameter.taskNames.any { task ->
+    task.contains("release", ignoreCase = true) &&
+        listOf("assemble", "bundle", "package", "install").any { task.contains(it, ignoreCase = true) }
+}
+if (releaseArtifactRequested) {
+    check(uploadSigningConfigured) {
+        "Release packaging requires ELT_UPLOAD_KEYSTORE_FILE, ELT_UPLOAD_KEYSTORE_PASSWORD, ELT_UPLOAD_KEY_ALIAS, and ELT_UPLOAD_KEY_PASSWORD."
+    }
+    val keystore = File(checkNotNull(uploadSigningValues["ELT_UPLOAD_KEYSTORE_FILE"]))
+    check(keystore.isAbsolute && keystore.isFile) { "The upload keystore must be an existing absolute file path." }
+    check(!keystore.canonicalFile.toPath().startsWith(rootProject.projectDir.canonicalFile.toPath())) {
+        "Keep the upload keystore outside the repository."
+    }
 }
 
 android {
@@ -17,6 +41,21 @@ android {
         versionCode = 1
         versionName = "0.1.0"
         ndk { abiFilters += "arm64-v8a" }
+    }
+    signingConfigs {
+        if (uploadSigningConfigured) {
+            create("eltUpload") {
+                storeFile = File(checkNotNull(uploadSigningValues["ELT_UPLOAD_KEYSTORE_FILE"]))
+                storePassword = checkNotNull(uploadSigningValues["ELT_UPLOAD_KEYSTORE_PASSWORD"])
+                keyAlias = checkNotNull(uploadSigningValues["ELT_UPLOAD_KEY_ALIAS"])
+                keyPassword = checkNotNull(uploadSigningValues["ELT_UPLOAD_KEY_PASSWORD"])
+            }
+        }
+    }
+    buildTypes {
+        getByName("release") {
+            if (uploadSigningConfigured) signingConfig = signingConfigs.getByName("eltUpload")
+        }
     }
     packaging {
         jniLibs.pickFirsts += "**/libc++_shared.so"
