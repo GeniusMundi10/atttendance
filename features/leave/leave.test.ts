@@ -22,7 +22,8 @@ test('monthly paid day is reserved once and only scoped actors decide it',{
     const accessSql=await readFile(fileURLToPath(new URL('../access/migrations/001_access.sql',import.meta.url)),'utf8')
     const leaveSql=await readFile(fileURLToPath(new URL('./migrations/001_paid_leave.sql',import.meta.url)),'utf8')
     const scheduleSql=await readFile(fileURLToPath(new URL('../schedule/migrations/001_schedule.sql',import.meta.url)),'utf8')
-    await a.query(accessSql);await a.query(leaveSql);await a.query(scheduleSql)
+    const leaveTypeSql=await readFile(fileURLToPath(new URL('./migrations/002_leave_type.sql',import.meta.url)),'utf8')
+    await a.query(accessSql);await a.query(leaveSql);await a.query(leaveTypeSql);await a.query(scheduleSql)
     const today=(await a.query("SELECT to_char((now() AT TIME ZONE 'Asia/Kolkata')::date,'YYYY-MM-DD') AS d")).rows[0].d as string
     const next=new Date(Date.parse(today+'T00:00:00Z')+86400000).toISOString().slice(0,10)
     if (next.slice(0,7)!==today.slice(0,7)) {t.skip('No future date remains in current month');return}
@@ -47,11 +48,16 @@ test('monthly paid day is reserved once and only scoped actors decide it',{
       catch(error) {await client.query('ROLLBACK');throw error}
     }
     assert.equal((await getLeaveBalance(a,employeeActor)).available,1)
-    await assert.rejects(tx(a,()=>applyForPaidLeave(a,managerActor,{workDate:next})),
+    await assert.rejects(tx(a,()=>applyForPaidLeave(a,employeeActor,{workDate:next,note:'   '})),
+      (error:unknown)=>error instanceof LeaveError && error.code==='note_required')
+    // Everyone follows the standard shift, so a Sunday is never a leave date.
+    let sunday=next
+    while (new Date(sunday+'T00:00:00Z').getUTCDay()!==0) sunday=new Date(Date.parse(sunday+'T00:00:00Z')+86400000).toISOString().slice(0,10)
+    if (sunday.slice(0,7)===today.slice(0,7)) await assert.rejects(tx(a,()=>applyForPaidLeave(a,managerActor,{workDate:sunday,note:'Family'})),
       (error:unknown)=>error instanceof LeaveError && error.code==='not_scheduled_work_date')
     const results=await Promise.allSettled([
-      tx(a,()=>applyForPaidLeave(a,employeeActor,{workDate:next})),
-      tx(b,()=>applyForPaidLeave(b,employeeActor,{workDate:next})),
+      tx(a,()=>applyForPaidLeave(a,employeeActor,{workDate:next,note:'Family'})),
+      tx(b,()=>applyForPaidLeave(b,employeeActor,{workDate:next,note:'Family'})),
     ])
     assert.equal(results.filter(r=>r.status==='fulfilled').length,1)
     assert.equal(results.filter(r=>r.status==='rejected').length,1)
@@ -74,11 +80,28 @@ test('monthly paid day is reserved once and only scoped actors decide it',{
       (error:unknown)=>error instanceof LeaveError && error.code==='reason_required')
     await tx(a,()=>decidePaidLeave(a,hrActor,{id,decision:'REJECT',reason:'Schedule correction'}))
     assert.equal((await getLeaveBalance(a,employeeActor)).available,1)
+    assert.equal((await listLeaveRequests(a,employeeActor)).find(r=>r.id===id)?.decisionReason,'Schedule correction')
     await tx(a,()=>decidePaidLeave(a,hrActor,{id,decision:'APPROVE',reason:'Verified schedule'}))
     assert.equal((await getLeaveBalance(a,employeeActor)).used,1)
     const history=await a.query('SELECT from_status,to_status,is_override FROM leave_decisions WHERE request_id=$1 ORDER BY decided_at,id',[id])
     assert.equal(history.rows.length,3)
     assert.equal(history.rows.filter(row=>row.is_override).length,2)
+
+    // Unpaid leave: one active request per date, and the paid-day balance never moves.
+    await assert.rejects(tx(a,()=>applyForPaidLeave(a,employeeActor,{workDate:next,note:'Family',leaveType:'UNPAID'})),
+      (error:unknown)=>error instanceof LeaveError && error.code==='date_already_requested')
+    await assert.rejects(tx(a,()=>applyForPaidLeave(a,employeeActor,{workDate:next,note:'Family',leaveType:'SICK'})),
+      (error:unknown)=>error instanceof LeaveError && error.code==='invalid_leave_type')
+    const later=new Date(Date.parse(next+'T00:00:00Z')+86400000).toISOString().slice(0,10)
+    if (later.slice(0,7)===today.slice(0,7)) {
+      await a.query('INSERT INTO leave_work_dates(employee_id,work_date) VALUES ($1,$2)',[employee,later])
+      const before=await getLeaveBalance(a,employeeActor)
+      assert.equal(before.available,0)
+      const unpaid=await tx(a,()=>applyForPaidLeave(a,employeeActor,{workDate:later,note:'Travel',leaveType:'UNPAID'}))
+      assert.equal((await listLeaveRequests(a,employeeActor)).find(r=>r.id===unpaid.id)?.leaveType,'UNPAID')
+      await tx(a,()=>decidePaidLeave(a,managerActor,{id:unpaid.id,decision:'APPROVE'}))
+      assert.deepEqual(await getLeaveBalance(a,employeeActor),before)
+    }
   } finally {
     await Promise.all(clients.map(c=>c.query('ROLLBACK').catch(()=>{})))
     await Promise.all(clients.map(c=>c.query('RESET search_path').catch(()=>{})))

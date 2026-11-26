@@ -9,7 +9,8 @@ import kotlin.math.roundToInt
 internal sealed interface CapturePurpose {
     data class Punch(val action: Action, val challenge: Challenge, val roster: List<Template>) : CapturePurpose
     data class Enrollment(val employeeId: String, val code: String) : CapturePurpose
-    data class SelfServiceEnrollment(val claim: EnrollmentClaim) : CapturePurpose
+    /** [poses] are the guided-angle embeddings collected before the live check; they are blended into the template. */
+    data class SelfServiceEnrollment(val claim: EnrollmentClaim, val poses: List<FloatArray> = emptyList()) : CapturePurpose
     data object Diagnostic : CapturePurpose
 }
 internal data class CaptureResult(val frames: JSONArray, val template: Template?, val embedding: JSONArray?)
@@ -60,10 +61,99 @@ internal class FaceCapture(val purpose: CapturePurpose, private val onSampleAcce
         samples += sample.embedding
         onSampleAccepted(frames.size)
         if (frames.size < 3) return null
+        val poses = (purpose as? CapturePurpose.SelfServiceEnrollment)?.poses.orEmpty()
+        // The angle sweep is unverified for liveness, so it must be the same person as the live frames.
+        if (poses.any { similarity(it, samples.first()) < PoseSweep.SAME_PERSON }) {
+            throw CaptureRejected("Keep the same person in view for the whole check.")
+        }
         val embedding = if (purpose is CapturePurpose.Enrollment || purpose is CapturePurpose.SelfServiceEnrollment) {
-            val average = normalized(FloatArray(128) { coordinate -> samples.sumOf { it[coordinate].toDouble() }.toFloat() })
+            val blended = samples + poses
+            val average = normalized(FloatArray(128) { coordinate -> blended.sumOf { it[coordinate].toDouble() }.toFloat() })
             JSONArray(average.map { (it * 10000).roundToInt() })
         } else null
         return CaptureResult(JSONArray(frames), template, embedding)
+    }
+}
+
+/**
+ * Guided enrollment angles: straight, one side, the other side, chin one way, then the other. Each step needs the face
+ * in the oval at that angle for two consecutive frames. Angles are measured against the employee's own straight pose.
+ */
+/** Thrown when the straight-ahead face already belongs to a registered employee; [firstName] is theirs. */
+internal class AlreadyRegistered(val firstName: String) : IllegalStateException("Face already registered")
+
+/**
+ * [roster] is this kiosk's registered faces. The enrolling employee has none yet, so any match is someone else;
+ * it is checked on the first step so they are stopped early. The server repeats this check on completion.
+ */
+internal class PoseSweep(val claim: EnrollmentClaim, val flow: Int, private val roster: List<Template> = emptyList()) {
+    companion object {
+        val prompts = listOf(
+            "Look straight",
+            "Turn your head left",
+            "Now turn right",
+            "Tilt your chin up a little",
+            "Now lower your chin a little",
+        )
+        // ponytail: calibration knobs on YuNet landmarks; retune per camera if steps feel too easy or too hard.
+        const val TURN = .22f
+        const val TILT = .08f
+        // The second tilt reverses the first, and a lowered chin shows less on camera, so it needs less travel.
+        const val RETURN_TILT = .05f
+        const val FACING = .12f
+        const val SAME_PERSON = .40
+        // Same score as a punch match and the server's DUPLICATE_FACE_SIMILARITY.
+        const val ALREADY_REGISTERED = .50
+    }
+
+    val embeddings = mutableListOf<FloatArray>()
+    var step = 0
+        private set
+    val done get() = step >= prompts.size
+    private var held = 0
+    private var baseYaw = 0f
+    private var basePitch = 0f
+    private var turnSign = 0f
+    private var tiltSign = 0f
+
+    /** Tilt steps tolerate the face drifting off-centre or shrinking, since a lowered chin moves it up in the frame. */
+    val tilting get() = step >= 3
+
+    /** Returns true when this frame completed a step. */
+    fun accept(tracked: Tracked, inOval: Boolean): Boolean {
+        val face = tracked.face
+        val embedding = tracked.embedding
+        if (done || face == null || embedding == null || !inOval) { held = 0; return false }
+        val turn = yaw(face) - baseYaw
+        val tilt = pitch(face) - basePitch
+        val posed = when (step) {
+            0 -> kotlin.math.abs(yaw(face)) < FACING
+            1 -> kotlin.math.abs(turn) > TURN
+            2 -> turn * turnSign < -TURN
+            3 -> kotlin.math.abs(tilt) > TILT
+            else -> tilt * tiltSign < -RETURN_TILT
+        }
+        if (!posed) { held = 0; return false }
+        if (++held < 2) return false
+        // A tilted face (a lowered chin most of all) often reads too poorly to match. Waiting for a clearer frame could
+        // stall forever, so the tilt step still counts but its embedding is left out of the template. The sweep is not
+        // a liveness proof, and the final live check still requires the same person.
+        val clear = embeddings.isEmpty() || similarity(embeddings.first(), embedding) >= SAME_PERSON
+        if (!clear && !tilting) throw CaptureRejected("Keep the same person in view for the whole check.")
+        if (step == 0) {
+            val match = roster.maxByOrNull { similarity(embedding, it.feature) }
+            if (match != null && similarity(embedding, match.feature) >= ALREADY_REGISTERED) {
+                throw AlreadyRegistered(match.displayName.substringBefore(' ').ifBlank { "there" })
+            }
+        }
+        when (step) {
+            0 -> { baseYaw = yaw(face); basePitch = pitch(face) }
+            1 -> turnSign = kotlin.math.sign(turn)
+            3 -> tiltSign = kotlin.math.sign(tilt)
+        }
+        if (clear) embeddings += embedding
+        held = 0
+        step += 1
+        return true
     }
 }

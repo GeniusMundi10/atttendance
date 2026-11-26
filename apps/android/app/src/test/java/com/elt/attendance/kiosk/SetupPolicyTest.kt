@@ -18,6 +18,18 @@ class SetupPolicyTest {
     }
 
     @Test
+    fun allowsLoopbackHttpOnlyWhenDebugSwitchIsOn() {
+        assertThrows(IllegalArgumentException::class.java) { SetupPolicy.origin("http://localhost:3001") }
+        SetupPolicy.allowLoopbackHttp = true
+        try {
+            assertEquals("http://localhost:3001", SetupPolicy.origin("http://localhost:3001"))
+            assertThrows(IllegalArgumentException::class.java) { SetupPolicy.origin("http://attendance.example") }
+        } finally {
+            SetupPolicy.allowLoopbackHttp = false
+        }
+    }
+
+    @Test
     fun validatesIntegrityProjectAndAdministratorPin() {
         assertEquals(123456789L, SetupPolicy.cloudProject(" 123456789 "))
         assertThrows(IllegalArgumentException::class.java) { SetupPolicy.cloudProject("0") }

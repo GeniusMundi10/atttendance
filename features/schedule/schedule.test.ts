@@ -42,8 +42,11 @@ test('2026 calendar, effective-dated shifts, scope, audit and leave use one sche
     assert.equal(await importAll(),15)
     assert.equal(await importAll(),0)
     assert.equal((await db.query("SELECT count(*)::int AS n FROM schedule_holidays WHERE classification='RESTRICTED'")).rows[0].n,6)
-    // Before any assignment the employee has no schedule.
-    assert.equal((await scheduleDays(db,employee,'2026-11-08','2026-11-08'))[0]!.kind,'UNASSIGNED')
+    // Before any assignment the employee follows the standard General Shift and its holidays.
+    const unassigned=await scheduleDays(db,employee,'2026-11-15','2026-11-16')
+    assert.deepEqual(unassigned.map(d=>[d.kind,d.shiftName]),[['WEEKLY_OFF','General Shift'],['WORKING','General Shift']])
+    const holiday=calendar.holidays.find((h:{classification:string})=>h.classification==='HOLIDAY')!
+    assert.equal((await scheduleDays(db,employee,holiday.date,holiday.date))[0]!.kind,'HOLIDAY')
     await assert.rejects(assignShift(db,employeeActor,{employeeId:employee,siteId:site,shiftId:general,effectiveFrom:'2026-01-01',reason:'self'}),AccessDeniedError)
     await assert.rejects(assignShift(db,managerActor,{employeeId:employee,siteId:site,shiftId:general,effectiveFrom:'2026-01-01',reason:'mgr'}),AccessDeniedError)
     await assert.rejects(assignShift(db,{...hrActor,aal:'aal1'},{employeeId:employee,siteId:site,shiftId:general,effectiveFrom:'2026-01-01',reason:'x'}),AccessDeniedError)

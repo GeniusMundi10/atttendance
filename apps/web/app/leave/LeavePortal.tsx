@@ -1,15 +1,18 @@
 'use client'
-// PURPOSE: Let a signed-in employee apply for one paid day and authorized readers decide it.
-import { createClient, type Session, type SupabaseClient } from '@supabase/supabase-js'
+// PURPOSE: Let a signed-in employee apply for paid or unpaid leave and see their requests; LeaveRequests also serves Admin for decisions.
 import { useEffect, useState, type FormEvent } from 'react'
-import { SecondFactor } from '../SecondFactor'
+import { useAuth } from '../AppShell'
+import { dayLabel } from '../Home'
 
 type Balance={month:string,credit:number,available:number,reserved:number,used:number}
-type LeaveRequest={id:string,employeeId:string,employeeName:string,workDate:string,status:'PENDING'|'APPROVED'|'REJECTED',note:string,createdAt:string,canDecide:boolean,canOverride:boolean}
+type LeaveType='PAID'|'UNPAID'
+type LeaveRequest={id:string,employeeId:string,employeeName:string,workDate:string,leaveType:LeaveType,status:'PENDING'|'APPROVED'|'REJECTED',note:string,decisionReason:string,createdAt:string,canDecide:boolean,canOverride:boolean}
 const labels:Record<string,string>={
   date_out_of_window:'Choose a future date in the current month.',
-  not_scheduled_work_date:'That date is not in your scheduled work dates. Ask HR to confirm your schedule.',
-  no_paid_day_available:'Your paid day for this month is already reserved or used.',
+  not_scheduled_work_date:'That day is already off (Sunday or a holiday). Pick a working day.',
+  no_paid_day_available:'Your paid day for this month is already reserved or used. You can apply for unpaid leave instead.',
+  date_already_requested:'You already have a leave request for that date.',
+  note_required:'Add a reason for your leave.',
   reason_required:'Enter a reason for this decision.',
   self_decision_forbidden:'You cannot decide your own request.',
   manager_cannot_override:'Only HR or an administrator can override a decision.',
@@ -17,63 +20,37 @@ const labels:Record<string,string>={
   access_denied:'You do not have access to this request.',
   sign_in_required:'Sign in to continue.',
 }
+const statusText={PENDING:'Pending',APPROVED:'Approved',REJECTED:'Rejected'}
+const done=['Request submitted for approval.','Decision recorded.']
 async function call<T>(path:string,token:string,init?:RequestInit):Promise<T> {
   const response=await fetch(path,{...init,cache:'no-store',headers:{Authorization:'Bearer '+token,...init?.headers}})
   const data=await response.json().catch(()=>({}))
   if (!response.ok) throw Error(typeof data.error==='string'?data.error:'service_unavailable')
   return data as T
 }
-export function LeavePortal() {
-  const [auth,setAuth]=useState<SupabaseClient>()
-  const [session,setSession]=useState<Session|null>(null)
-  const [email,setEmail]=useState('')
-  const [workDate,setWorkDate]=useState('')
-  const [note,setNote]=useState('')
+function Message({message}:{message:string}) {
+  const {requireMfa}=useAuth()
+  useEffect(()=>{if (message==='mfa_required') requireMfa()},[message])
+  const friendly=labels[message]??(message==='mfa_required'?'Verify your authenticator to continue.':message==='service_unavailable'?'Leave is temporarily unavailable. Refresh to retry.':message)
+  return friendly?<p role="status" className={done.includes(message)?'notice':'form-error'}>{friendly}</p>:null
+}
+
+/** Own requests (`mine`), or requests this reader may decide (Admin). `refresh` reloads when it changes. */
+export function LeaveRequests({mine,refresh=0}:{mine:boolean,refresh?:number}) {
+  const {token}=useAuth()
+  const [requests,setRequests]=useState<LeaveRequest[]|null>(null)
   const [reasons,setReasons]=useState<Record<string,string>>({})
-  const [balance,setBalance]=useState<Balance>()
-  const [requests,setRequests]=useState<LeaveRequest[]>([])
   const [message,setMessage]=useState('')
   const [busy,setBusy]=useState(false)
   const [reload,setReload]=useState(0)
   useEffect(()=>{
-    const url=process.env.NEXT_PUBLIC_SUPABASE_URL,key=process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
-    if (!url || !key) {setMessage('Sign-in has not been configured. Contact HR.');return}
-    const client=createClient(url,key)
-    setAuth(client)
-    void client.auth.getSession().then(({data})=>setSession(data.session))
-    const {data}=client.auth.onAuthStateChange((_event,next)=>setSession(next))
-    return ()=>data.subscription.unsubscribe()
-  },[])
-  const token=session?.access_token
-  useEffect(()=>{
-    setBalance(undefined);setRequests([])
     if (!token) return
     const controller=new AbortController()
-    Promise.all([
-      call<{balance:Balance}>('/api/leave/balance',token,{signal:controller.signal}),
-      call<{requests:LeaveRequest[]}>('/api/leave/requests',token,{signal:controller.signal}),
-    ]).then(([a,b])=>{if (!controller.signal.aborted) {setBalance(a.balance);setRequests(b.requests);setMessage('')}})
+    call<{requests:LeaveRequest[]}>('/api/leave/requests',token,{signal:controller.signal})
+      .then(data=>{if (!controller.signal.aborted) setRequests(data.requests)})
       .catch(e=>{if (!controller.signal.aborted) setMessage(e instanceof Error?e.message:'service_unavailable')})
     return ()=>controller.abort()
-  },[token,reload])
-  async function signIn(event:FormEvent) {
-    event.preventDefault()
-    if (!auth || busy) return
-    setBusy(true)
-    try {
-      const {error}=await auth.auth.signInWithOtp({email:email.trim(),options:{shouldCreateUser:false,emailRedirectTo:location.origin+'/leave'}})
-      setMessage(error?'Sign-in link unavailable. Contact HR.':'Check your work email for the sign-in link.')
-    } catch {setMessage('Could not reach sign-in. Please retry.')} finally {setBusy(false)}
-  }
-  async function apply(event:FormEvent) {
-    event.preventDefault()
-    if (!token || busy) return
-    setBusy(true)
-    try {
-      await call('/api/leave/requests',token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workDate,note})})
-      setWorkDate('');setNote('');setMessage('Request submitted for approval.');setReload(x=>x+1)
-    } catch(e) {setMessage(e instanceof Error?e.message:'service_unavailable')} finally {setBusy(false)}
-  }
+  },[token,reload,refresh])
   async function decide(id:string,decision:'APPROVE'|'REJECT') {
     if (!token || busy) return
     setBusy(true)
@@ -82,15 +59,91 @@ export function LeavePortal() {
       setMessage('Decision recorded.');setReload(x=>x+1)
     } catch(e) {setMessage(e instanceof Error?e.message:'service_unavailable')} finally {setBusy(false)}
   }
-  const friendly=labels[message]??(message==='mfa_required'?'Verify your authenticator to continue.':message==='service_unavailable'?'Leave is temporarily unavailable. Refresh to retry.':message)
-  if (!session) return <section><h1>Paid leave</h1><form onSubmit={signIn}><label>Work email<input type="email" autoComplete="email" required value={email} onChange={e=>setEmail(e.target.value)}/></label><button disabled={!auth||busy}>Email sign-in link</button></form><p role="status">{friendly}</p></section>
-  if (auth && message==='mfa_required') return <section><h1>Paid leave</h1><SecondFactor auth={auth} onVerified={()=>{void auth.auth.refreshSession().then(({data})=>{setSession(data.session);setReload(x=>x+1)})}}/><button className="secondary" onClick={()=>void auth.auth.signOut()}>Sign out</button></section>
-  return <section><header><h1>Paid leave</h1><button className="secondary" onClick={()=>void auth?.auth.signOut()}>Sign out</button></header>
-    <p>One paid day is credited each month. Unused days do not carry forward. Apply for a scheduled full work date in the current month.</p>
-    {balance && <p><strong>{balance.month} balance:</strong> {balance.available} available · {balance.reserved} awaiting decision · {balance.used} used</p>}
-    <form onSubmit={apply}><h2>Apply for a paid day</h2><label>Scheduled work date<input type="date" required value={workDate} onChange={e=>setWorkDate(e.target.value)}/></label><label>Note (optional)<textarea maxLength={1000} value={note} onChange={e=>setNote(e.target.value)}/></label><button disabled={busy||balance?.available===0}>Submit request</button></form>
-    <div className="controls"><h2>Requests</h2><button className="secondary" onClick={()=>setReload(x=>x+1)}>Refresh</button></div>
-    <p role="status">{friendly}</p>
-    {requests.length?<table><thead><tr><th>Employee</th><th>Date</th><th>Status</th><th>Decision</th></tr></thead><tbody>{requests.map(request=><tr key={request.id}><td>{request.employeeName}</td><td>{request.workDate}</td><td>{request.status}</td><td>{(request.canDecide||request.canOverride)&&<div><label>Reason<input value={reasons[request.id]??''} maxLength={1000} onChange={e=>setReasons(old=>({...old,[request.id]:e.target.value}))}/></label>{request.status==='PENDING'?<><button disabled={busy} onClick={()=>void decide(request.id,'APPROVE')}>Approve</button> <button disabled={busy} onClick={()=>void decide(request.id,'REJECT')}>Reject</button></>:request.canOverride?<button disabled={busy} onClick={()=>void decide(request.id,request.status==='APPROVED'?'REJECT':'APPROVE')}>Override to {request.status==='APPROVED'?'reject':'approve'}</button>:null}</div>}</td></tr>)}</tbody></table>:<p>No leave requests to show.</p>}
+  // Admin lists everything it can see, own requests included (read-only: nobody decides their own leave).
+  const shown=(requests??[]).filter(r=>!mine||!(r.canDecide||r.canOverride))
+    .sort((a,b)=>Number(b.status==='PENDING')-Number(a.status==='PENDING'))
+  return <>
+    <Message message={message}/>
+    {requests===null?<p className="muted">Loading…</p>:shown.length?<ul className="leave-requests">{shown.map(request=><li key={request.id} className="card">
+      <div className="leave-row">
+        <div>
+          <strong>{mine?'':request.employeeName+' · '}{dayLabel.format(new Date(request.workDate+'T12:00:00+05:30'))}</strong>
+          <p>{request.leaveType==='PAID'?'Paid leave':'Unpaid leave'}</p>
+        </div>
+        <span className={'status '+request.status.toLowerCase()}>{statusText[request.status]}</span>
+      </div>
+      {request.note && <p className="leave-note"><b>Reason</b>{request.note}</p>}
+      {request.decisionReason && <p className={'leave-note '+request.status.toLowerCase()}><b>{request.status==='REJECTED'?'Rejection reason':'Decision note'}</b>{request.decisionReason}</p>}
+      {!mine&&!(request.canDecide||request.canOverride)&&<p className="muted small own-note">Your request · needs another HR or admin to decide</p>}
+      {(request.canDecide||request.canOverride)&&!mine&&(()=>{
+        // Rejections and HR overrides must carry a message; a manager approving a pending request need not.
+        const reason=(reasons[request.id]??'').trim()
+        return <div className="decide">
+          <label>Message to employee<input value={reasons[request.id]??''} maxLength={1000} placeholder="Required to reject" onChange={e=>setReasons(old=>({...old,[request.id]:e.target.value}))}/></label>
+          <div className="decide-buttons">{request.status==='PENDING'?<><button disabled={busy||(request.canOverride&&!reason)} onClick={()=>void decide(request.id,'APPROVE')}>Approve</button><button className="secondary" disabled={busy||!reason} onClick={()=>void decide(request.id,'REJECT')}>Reject</button></>
+            :request.canOverride?<button className="secondary" disabled={busy||!reason} onClick={()=>void decide(request.id,request.status==='APPROVED'?'REJECT':'APPROVE')}>Override to {request.status==='APPROVED'?'reject':'approve'}</button>:null}</div>
+        </div>
+      })()}
+    </li>)}</ul>:<p className="muted">{mine?'No leave requests yet.':'No leave requests to handle.'}</p>}
+  </>
+}
+
+export function LeavePortal() {
+  const {token}=useAuth()
+  const [leaveType,setLeaveType]=useState<LeaveType>('PAID')
+  const [workDate,setWorkDate]=useState('')
+  const [note,setNote]=useState('')
+  const [balance,setBalance]=useState<Balance>()
+  const [message,setMessage]=useState('')
+  const [busy,setBusy]=useState(false)
+  const [reload,setReload]=useState(0)
+  useEffect(()=>{
+    setBalance(undefined)
+    if (!token) return
+    const controller=new AbortController()
+    call<{balance:Balance}>('/api/leave/balance',token,{signal:controller.signal})
+      .then(a=>{if (!controller.signal.aborted) setBalance(a.balance)})
+      .catch(e=>{if (!controller.signal.aborted) setMessage(e instanceof Error?e.message:'service_unavailable')})
+    return ()=>controller.abort()
+  },[token,reload])
+  // No paid day left: default to unpaid so the form stays usable.
+  useEffect(()=>{if (balance?.available===0) setLeaveType('UNPAID')},[balance?.available])
+  async function apply(event:FormEvent) {
+    event.preventDefault()
+    if (!token || busy) return
+    setBusy(true)
+    try {
+      await call('/api/leave/requests',token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workDate,note,leaveType})})
+      setWorkDate('');setNote('');setMessage('Request submitted for approval.');setReload(x=>x+1)
+    } catch(e) {setMessage(e instanceof Error?e.message:'service_unavailable')} finally {setBusy(false)}
+  }
+  const paidLeft=balance?.available??0
+  return <section className="leave">
+    <h1>Leave</h1>
+    <p className="page-lead">Take a full working day off this month. Sundays and holidays are already off.</p>
+
+    <form onSubmit={apply} className="card leave-form">
+      <fieldset className="leave-types">
+        <legend>Leave type</legend>
+        <label className={leaveType==='PAID'?'on':undefined}>
+          <input type="radio" name="leaveType" value="PAID" checked={leaveType==='PAID'} disabled={paidLeft===0} onChange={()=>setLeaveType('PAID')}/>
+          <strong>Paid leave</strong>
+          <span>{balance?`${paidLeft} of ${balance.credit} left this month`:'Loading…'}</span>
+        </label>
+        <label className={leaveType==='UNPAID'?'on':undefined}>
+          <input type="radio" name="leaveType" value="UNPAID" checked={leaveType==='UNPAID'} onChange={()=>setLeaveType('UNPAID')}/>
+          <strong>Unpaid leave</strong>
+          <span>No pay for the day</span>
+        </label>
+      </fieldset>
+      <label>Date<input type="date" required value={workDate} onChange={e=>setWorkDate(e.target.value)}/></label>
+      <label>Reason for leave<textarea required maxLength={1000} rows={3} placeholder="e.g. Family function, medical appointment" value={note} onChange={e=>setNote(e.target.value)}/></label>
+      <button disabled={busy||(leaveType==='PAID'&&paidLeft===0)}>{busy?'Submitting…':`Apply for ${leaveType==='PAID'?'paid':'unpaid'} leave`}</button>
+      <Message message={message}/>
+    </form>
+    <p className="muted small">One paid day is credited each month and does not carry forward.</p>
+
+    <div className="section-head"><h2>My requests</h2><button className="link-button" onClick={()=>setReload(x=>x+1)}>Refresh</button></div>
+    <LeaveRequests mine refresh={reload}/>
   </section>
 }

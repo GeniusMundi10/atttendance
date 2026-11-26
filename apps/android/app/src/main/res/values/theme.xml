@@ -1,10 +1,12 @@
-<!-- PURPOSE: Give the company kiosk the ELT portal's colors and a legible neutral background. -->
+<!-- PURPOSE: Give the company kiosk the ELT orange accent on a warm background with edge-to-edge system bars. -->
 <resources>
     <style name="EltKiosk" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:colorAccent">#FF7A03</item>
-        <item name="android:windowBackground">#F7F5F0</item>
-        <item name="android:textColorPrimary">#191816</item>
-        <item name="android:colorButtonNormal">#EAE6DE</item>
-        <item name="android:statusBarColor">#191816</item>
+        <item name="android:colorAccent">#FF6330</item>
+        <item name="android:colorControlActivated">#FF6330</item>
+        <item name="android:windowBackground">#FFF7F3</item>
+        <item name="android:textColorPrimary">#1A1917</item>
+        <item name="android:colorButtonNormal">#EAE2DC</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
     </style>
 </resources>

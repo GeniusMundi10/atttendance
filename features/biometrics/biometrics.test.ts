@@ -101,3 +101,21 @@ test("live capture enforces frame spacing and match margins", () => {
   frames[1][3] = 900;
   assert.throws(() => checkSequence(frames, true), failure("BIOMETRIC_VERIFICATION_FAILED"));
 });
+
+test("the local integrity bypass is honoured in development and refused in production", async () => {
+  const { verifyPlayIntegrity } = await import("./integrity.ts");
+  const saved = { bypass: process.env.KIOSK_INTEGRITY_DEV_BYPASS, env: process.env.NODE_ENV, cert: process.env.KIOSK_PLAY_CERT_SHA256 };
+  const env = process.env as Record<string, string | undefined>;
+  try {
+    delete process.env.KIOSK_PLAY_CERT_SHA256;
+    process.env.KIOSK_INTEGRITY_DEV_BYPASS = "1";
+    env.NODE_ENV = "development";
+    await verifyPlayIntegrity("placeholder", "payload", 0);
+    env.NODE_ENV = "production";
+    await assert.rejects(verifyPlayIntegrity("placeholder", "payload", 0), failure("KIOSK_INTEGRITY_UNAVAILABLE"));
+  } finally {
+    for (const [key, value] of [["KIOSK_INTEGRITY_DEV_BYPASS", saved.bypass], ["NODE_ENV", saved.env], ["KIOSK_PLAY_CERT_SHA256", saved.cert]] as const) {
+      if (value === undefined) delete env[key]; else env[key] = value;
+    }
+  }
+});

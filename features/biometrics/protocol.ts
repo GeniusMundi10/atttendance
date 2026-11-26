@@ -4,11 +4,14 @@ import { createHash } from "node:crypto";
 export class BiometricsError extends Error {
   code: string;
   status: number;
+  /** Non-secret fields returned beside the error code, e.g. the registered first name on a duplicate face. */
+  detail: Record<string, string>;
 
-  constructor(code: string, status = 400) {
+  constructor(code: string, status = 400, detail: Record<string, string> = {}) {
     super(code);
     this.code = code;
     this.status = status;
+    this.detail = detail;
   }
 }
 

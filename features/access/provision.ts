@@ -1,5 +1,6 @@
 // PURPOSE: Provision kiosk people and reader scope through an offline database operator command.
 import pg from 'pg';
+import { linkSignup } from './access.ts';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -84,6 +85,22 @@ async function main(): Promise<void> {
            ON CONFLICT (manager_id, report_id) DO UPDATE SET active = true`,
           [requireUuid(args[0]), requireUuid(args[1])],
         );
+        break;
+      }
+      case 'whatsapp': {
+        if (args.length !== 2 || !/^\+[1-9][0-9]{7,14}$/.test(args[1] ?? '')) throw new Error('Usage: whatsapp EMPLOYEE_UUID +E164_NUMBER');
+        await client.query('UPDATE access_employees SET whatsapp_number = $2 WHERE id = $1', [requireUuid(args[0]), args[1]]);
+        break;
+      }
+      case 'approve-signup': {
+        // Bootstraps the first admin (nobody can approve them in the app yet); add `operator-role` afterwards.
+        if (args.length !== 1) throw new Error('Usage: approve-signup EMAIL');
+        const request = await client.query<{ request_id: string }>(
+          'SELECT request_id FROM access_signup_requests WHERE lower(email) = lower($1)', [requireText(args[0])]);
+        if (request.rows.length !== 1) throw new Error('Usage: approve-signup EMAIL (the person must sign up in the app first)');
+        const created = await linkSignup(client, request.rows[0]!.request_id);
+        process.stdout.write(`Employee ${created.employeeCode} ${created.employeeId}
+`);
         break;
       }
       case 'deactivate-employee': {

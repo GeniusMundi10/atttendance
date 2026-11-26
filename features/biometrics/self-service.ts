@@ -1,13 +1,13 @@
 // PURPOSE: Own employee self-service face enrollment, kiosk session recovery, and HR reset transactions.
 import {
-  createCipheriv, createHmac, createPublicKey, randomBytes, randomInt, randomUUID, verify,
+  createCipheriv, createDecipheriv, createHmac, createPublicKey, randomBytes, randomInt, randomUUID, verify,
 } from "node:crypto";
 import {
   BiometricsError, hash, object, proof, signedIntegrityPayload, signedRequest, uuid,
 } from "./protocol.ts";
 import type { Frame, RequestProof } from "./protocol.ts";
 import { verifyPlayIntegrity } from "./integrity.ts";
-import { AccessDeniedError, authorizeFaceRegistrationReset, listActiveSiteAssignments } from "../access/access.ts";
+import { AccessDeniedError, authorizeFaceRegistrationReset, authorizeHrOperator, listActiveSiteAssignments } from "../access/access.ts";
 import type { Actor } from "../access/access.ts";
 
 type Db = {
@@ -28,6 +28,11 @@ export interface FaceEnrollmentStatus {
   activeCodeRequest: null | { requestId: string; siteId: string; state: "issued"; expiresAt: string };
   notice: null | { version: string; text: string };
   canReset: boolean;
+  employeeId: string;
+  displayName: string;
+  employeeCode: string | null;
+  approvalPending: boolean;
+  reregistrationRequested: boolean;
 }
 export interface IssuedEnrollmentCode {
   state: "issued";
@@ -94,9 +99,9 @@ export function siteScopedEnrollmentDigest(siteId: string, code: string, key = d
 
 async function lockRegistration(tx: Db, employeeId: string) {
   await tx.query(`INSERT INTO kiosk_face_registrations(employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING`, [employeeId]);
-  const { rows } = await tx.query(`SELECT registration_revision, template_id FROM kiosk_face_registrations WHERE employee_id = $1 FOR UPDATE`, [employeeId]);
+  const { rows } = await tx.query(`SELECT registration_revision, template_id, approved_at FROM kiosk_face_registrations WHERE employee_id = $1 FOR UPDATE`, [employeeId]);
   if (!rows[0]) throw fail("FACE_REGISTRATION_UNAVAILABLE", 503);
-  return { revision: Number(rows[0].registration_revision), templateId: rows[0].template_id as string | null };
+  return { revision: Number(rows[0].registration_revision), templateId: rows[0].template_id as string | null, approved: rows[0].approved_at != null };
 }
 
 async function registeredDevice(tx: Db, deviceId: string, updateLock = false): Promise<RegisteredDevice> {
@@ -187,11 +192,13 @@ export async function getFaceEnrollmentStatus(
 ): Promise<FaceEnrollmentStatus> {
   const employeeId = uuid(input.employeeId);
   const assignments = await listActiveSiteAssignments(tx, employeeId);
-  const employeeResult = await tx.query(`SELECT active FROM access_employees WHERE id = $1`, [employeeId]);
+  const employeeResult = await tx.query(`SELECT active, employee_code, display_name FROM access_employees WHERE id = $1`, [employeeId]);
   const activeEmployee = employeeResult.rows[0]?.active === true;
-  const { rows: registrationRows } = await tx.query(`SELECT registration_revision, template_id FROM kiosk_face_registrations WHERE employee_id = $1`, [employeeId]);
+  const { rows: registrationRows } = await tx.query(`SELECT registration_revision, template_id, approved_at FROM kiosk_face_registrations WHERE employee_id = $1`, [employeeId]);
   const registrationRevision = registrationRows[0] ? Number(registrationRows[0].registration_revision) : 1;
   const registered = !!registrationRows[0]?.template_id;
+  const approved = registrationRows[0]?.approved_at != null;
+  const { rows: reregistration } = await tx.query(`SELECT 1 FROM kiosk_face_reregistration_requests WHERE employee_id = $1 AND resolved_at IS NULL`, [employeeId]);
   const { rows: codeRows } = await tx.query(`
     SELECT request_id,site_id,state,expires_at FROM kiosk_face_enrollment_requests
      WHERE employee_id = $1 AND state = 'issued' AND expires_at > clock_timestamp()
@@ -210,7 +217,7 @@ export async function getFaceEnrollmentStatus(
   return {
     registered,
     registrationRevision,
-    registrationAvailable: !registered && activeEmployee && assignments.length > 0 && notice !== null,
+    registrationAvailable: !registered && approved && activeEmployee && assignments.length > 0 && notice !== null,
     eligibleSites: assignments,
     attendanceReadiness: { activeEmployee, activeSiteAssignmentCount: assignments.length },
     activeCodeRequest: codeRows[0] ? {
@@ -219,6 +226,11 @@ export async function getFaceEnrollmentStatus(
     } : null,
     notice,
     canReset,
+    employeeId,
+    displayName: typeof employeeResult.rows[0]?.display_name === "string" ? employeeResult.rows[0].display_name : "",
+    employeeCode: typeof employeeResult.rows[0]?.employee_code === "string" ? employeeResult.rows[0].employee_code : null,
+    approvalPending: !registered && !approved,
+    reregistrationRequested: reregistration.length > 0,
   };
 }
 
@@ -242,6 +254,7 @@ export async function issueFaceEnrollmentCode(
     return { state: "issued", requestId, siteId, code: null, expiresAt: iso(row.expires_at), recovered: true };
   }
   if (registration.templateId) throw fail("FACE_ALREADY_REGISTERED", 409);
+  if (!registration.approved) throw fail("FACE_ENROLLMENT_APPROVAL_PENDING", 403);
   if (!await activeAssignment(tx, employeeId, siteId)) throw fail("FACE_ENROLLMENT_SITE_UNAVAILABLE", 403);
   const activeSession = await tx.query(`SELECT request_id FROM kiosk_face_enrollment_requests WHERE employee_id = $1 AND state = 'claimed' AND capture_expires_at > clock_timestamp() LIMIT 1`, [employeeId]);
   if (activeSession.rows.length) throw fail("ACTIVE_ENROLLMENT_SESSION_EXISTS", 409);
@@ -411,7 +424,43 @@ function encryptEmbedding(embedding: number[], identity: string): string {
   return Buffer.concat([iv, cipher.update(JSON.stringify(embedding)), cipher.final(), cipher.getAuthTag()]).toString("base64url");
 }
 
-export async function completeFaceEnrollment(tx: Db, input: unknown): Promise<{ state: "completed"; completedAt: string }> {
+function openEmbedding(value: string, identity: string): number[] {
+  const text = process.env.KIOSK_TEMPLATE_KEY_HEX;
+  if (!text || !/^[\da-f]{64}$/i.test(text)) throw fail("KIOSK_TEMPLATES_UNAVAILABLE", 503);
+  try {
+    const bytes = Buffer.from(value, "base64url");
+    const decipher = createDecipheriv("aes-256-gcm", Buffer.from(text, "hex"), bytes.subarray(0, 12));
+    decipher.setAAD(Buffer.from(identity, "utf8"));
+    decipher.setAuthTag(bytes.subarray(-16));
+    return JSON.parse(Buffer.concat([decipher.update(bytes.subarray(12, -16)), decipher.final()]).toString("utf8"));
+  } catch {
+    throw fail("KIOSK_TEMPLATES_UNAVAILABLE", 503);
+  }
+}
+
+// ponytail: same score the kiosk accepts as a punch match, so any face the kiosk could confuse counts as a duplicate. Calibration knob.
+export const DUPLICATE_FACE_SIMILARITY = 0.5;
+
+/**
+ * First name of another active employee whose registered face matches [embedding] (unit vector scaled to 10000), else null.
+ * ponytail: decrypts every active template per enrollment, O(employees); fine for one company, index embeddings past ~10k.
+ */
+export async function findRegisteredFace(tx: { query(sql: string, values?: unknown[]): Promise<{ rows: Record<string, unknown>[] }> }, embedding: number[], employeeId: string): Promise<string | null> {
+  const { rows } = await tx.query(`
+    SELECT template.template_id, template.site_id, template.employee_id, template.sealed_embedding, employee.display_name
+      FROM kiosk_face_templates template
+      JOIN access_employees employee ON employee.id = template.employee_id AND employee.active
+     WHERE template.retired_at IS NULL AND template.employee_id <> $1
+  `, [employeeId]);
+  for (const row of rows) {
+    const other = openEmbedding(String(row.sealed_embedding), `${row.site_id}/${row.employee_id}/${row.template_id}`);
+    const score = embedding.reduce((sum, value, index) => sum + value * (other[index] ?? 0), 0) / 1e8;
+    if (score >= DUPLICATE_FACE_SIMILARITY) return shortName(row.display_name) || "A colleague";
+  }
+  return null;
+}
+
+export async function completeFaceEnrollment(tx: Db, input: unknown): Promise<{ state: "completed"; completedAt: string } | { state: "duplicate"; registeredName: string }> {
   const request = parseComplete(input);
   const device = await registeredDevice(tx, request.deviceId);
   const payload = completionPayload(request);
@@ -445,6 +494,12 @@ export async function completeFaceEnrollment(tx: Db, input: unknown): Promise<{ 
   if (!await activeAssignment(tx, employeeId, device.siteId)) throw fail("KIOSK_ENROLLMENT_REJECTED", 403);
   await consumeProof(tx, device.deviceId, request.requestId);
   await verifyPlayIntegrity(request.integrityToken, payload, Date.parse(request.issuedAt) - 5_000);
+  const registeredName = await findRegisteredFace(tx, request.embedding, employeeId);
+  if (registeredName) {
+    // Commit the cancellation so this capture can never be retried; the claimed code is spent.
+    await tx.query(`UPDATE kiosk_face_enrollment_requests SET state = 'cancelled' WHERE request_id = $1 AND state = 'claimed'`, [session.request_id]);
+    return { state: "duplicate", registeredName };
+  }
   const templateId = randomUUID();
   const identityText = `${device.siteId}/${employeeId}/${templateId}`;
   const inserted = await tx.query(`
@@ -545,6 +600,7 @@ export async function resetFaceRegistration(
   }
   await tx.query(`UPDATE kiosk_face_templates SET retired_at = clock_timestamp() WHERE employee_id = $1 AND retired_at IS NULL`, [employeeId]);
   await tx.query(`DELETE FROM kiosk_face_enrollment_codes WHERE employee_id = $1`, [employeeId]);
+  await tx.query(`UPDATE kiosk_face_reregistration_requests SET resolved_at = clock_timestamp() WHERE employee_id = $1 AND resolved_at IS NULL`, [employeeId]);
   await tx.query(`UPDATE kiosk_face_enrollment_requests SET state = 'cancelled' WHERE employee_id = $1 AND state IN ('issued','claimed')`, [employeeId]);
   const updated = await tx.query(`
     UPDATE kiosk_face_registrations
@@ -558,4 +614,53 @@ export async function resetFaceRegistration(
     VALUES ($1,$2,$3,$4,$5,$6,$7)
   `, [requestId, employeeId, actor.employeeId, input.reason.trim(), registration.revision, Number(updated.rows[0].registration_revision), payloadHash]);
   return { employeeId, oldRevision: registration.revision, registrationRevision: Number(updated.rows[0].registration_revision), resetAt: iso(updated.rows[0].updated_at), recovered: false };
+}
+
+/** HR/ADMIN approval that lets a signed-up employee issue a self-service enrollment code. Idempotent. */
+export async function approveFaceEnrollment(tx: Db, input: { employeeId: string }, actor: Actor): Promise<{ employeeId: string; approved: true }> {
+  const employeeId = uuid(input.employeeId);
+  await authorizeFaceRegistrationReset(tx, { actor, employeeId });
+  await lockRegistration(tx, employeeId);
+  await tx.query(`UPDATE kiosk_face_registrations SET approved_at = coalesce(approved_at, clock_timestamp()), updated_at = clock_timestamp() WHERE employee_id = $1`, [employeeId]);
+  return { employeeId, approved: true };
+}
+
+/** An employee's own request for HR to reset their face (Settings, Biometric issues). One open request per employee. */
+export async function requestFaceReregistration(
+  tx: Db,
+  input: { employeeId: string; requestId: string; reason: unknown },
+): Promise<{ requestId: string; state: "open" }> {
+  const employeeId = uuid(input.employeeId);
+  const requestId = uuid(input.requestId);
+  if (typeof input.reason !== "string" || input.reason.trim().length < 1 || input.reason.trim().length > 1000) throw fail("INVALID_REREGISTRATION_REASON");
+  const registration = await lockRegistration(tx, employeeId);
+  if (!registration.templateId) throw fail("FACE_NOT_REGISTERED", 409);
+  const open = await tx.query(`SELECT request_id FROM kiosk_face_reregistration_requests WHERE employee_id = $1 AND resolved_at IS NULL`, [employeeId]);
+  if (open.rows[0]) return { requestId: String(open.rows[0].request_id), state: "open" };
+  await tx.query(`INSERT INTO kiosk_face_reregistration_requests(request_id, employee_id, reason) VALUES ($1, $2, $3)`, [requestId, employeeId, input.reason.trim()]);
+  return { requestId, state: "open" };
+}
+
+/** HR work queue: employees awaiting enrollment approval and open re-registration requests. */
+export async function listFaceEnrollmentQueue(tx: Db, actor: Actor) {
+  await authorizeHrOperator(tx, actor);
+  const pending = await tx.query(`
+    SELECT employee.id, employee.employee_code, employee.display_name
+      FROM access_employees employee
+      LEFT JOIN kiosk_face_registrations registration ON registration.employee_id = employee.id
+     WHERE employee.active AND registration.approved_at IS NULL AND registration.template_id IS NULL
+     ORDER BY employee.employee_code LIMIT 200
+  `);
+  const requests = await tx.query(`
+    SELECT request.request_id, employee.id, employee.employee_code, employee.display_name, request.reason, request.created_at
+      FROM kiosk_face_reregistration_requests request
+      JOIN access_employees employee ON employee.id = request.employee_id
+     WHERE request.resolved_at IS NULL
+     ORDER BY request.created_at LIMIT 200
+  `);
+  const person = (row: Record<string, unknown>) => ({ employeeId: String(row.id), employeeCode: String(row.employee_code), displayName: String(row.display_name) });
+  return {
+    pendingApprovals: pending.rows.map(person),
+    reregistrationRequests: requests.rows.map(row => ({ ...person(row), requestId: String(row.request_id), reason: String(row.reason), createdAt: iso(row.created_at) })),
+  };
 }

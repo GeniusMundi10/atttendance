@@ -6,10 +6,14 @@ import java.net.URI
 internal object SetupPolicy {
     private val pinPattern = Regex("[0-9]{8,12}")
 
+    // ponytail: debug builds only (set from KioskActivity), so `adb reverse` can reach a laptop server over USB.
+    @Volatile var allowLoopbackHttp = false
+
     fun origin(raw: String): String {
         val value = raw.trim()
         val uri = URI(value)
-        require(uri.scheme.equals("https", ignoreCase = true) && uri.host != null)
+        val loopbackHttp = allowLoopbackHttp && uri.scheme.equals("http", ignoreCase = true) && uri.host in setOf("localhost", "127.0.0.1")
+        require((uri.scheme.equals("https", ignoreCase = true) || loopbackHttp) && uri.host != null)
         require(uri.userInfo == null && uri.rawQuery == null && uri.rawFragment == null)
         require(uri.path.isNullOrEmpty() || uri.path == "/")
         require(uri.port == -1 || uri.port in 1..65535)

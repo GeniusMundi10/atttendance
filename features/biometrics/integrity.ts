@@ -46,6 +46,9 @@ async function requestOAuth() {
 }
 
 export async function verifyPlayIntegrity(token: string, payload: string, earliest: number): Promise<void> {
+  // ponytail: local end-to-end testing with a sideloaded debug APK. Skips only Google's verdict; device signatures,
+  // liveness metrics and everything else are still verified. Refused under NODE_ENV=production (next build/start).
+  if (process.env.KIOSK_INTEGRITY_DEV_BYPASS === "1" && process.env.NODE_ENV !== "production") return;
   const cert = process.env.KIOSK_PLAY_CERT_SHA256;
   if (!cert || !/^[\da-f]{64}$/i.test(cert)) throw new BiometricsError("KIOSK_INTEGRITY_UNAVAILABLE", 503);
   let result;

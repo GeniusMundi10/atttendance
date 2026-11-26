@@ -38,6 +38,8 @@ node --experimental-strip-types features/access/provision.ts assign-site EMPLOYE
 node --experimental-strip-types features/access/provision.ts link-subject PROVIDER EMPLOYEE_UUID < SUBJECT_FILE
 node --experimental-strip-types features/access/provision.ts operator-role EMPLOYEE_UUID HR|ADMIN
 node --experimental-strip-types features/access/provision.ts manager-report MANAGER_UUID REPORT_UUID
+node --experimental-strip-types features/access/provision.ts whatsapp EMPLOYEE_UUID +E164_NUMBER
+node --experimental-strip-types features/access/provision.ts approve-signup EMAIL   # first admin only; others are approved in the app
 node --experimental-strip-types features/access/provision.ts deactivate-employee EMPLOYEE_UUID
 ```
 

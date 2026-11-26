@@ -16,7 +16,14 @@ before applying. For legacy onboarding only, an operator can still register
 explicit dates with `LEAVE_PROVISION_DATABASE_URL` and
 `node --experimental-strip-types features/leave/provision-work-date.ts EMPLOYEE_UUID YYYY-MM-DD`.
 Use a restricted database account for provisioning. This slice does not prorate
-for joining date, calculate payroll pay, or support other leave categories.
+for joining date or calculate payroll pay.
+
+Requests are `PAID` or `UNPAID` (`migrations/002_leave_type.sql`). Unpaid leave
+uses the same date window, schedule check and approval flow but never touches
+the balance; it is recorded only, with no salary effect. Every request needs a
+note (`note_required`), a date can hold only one non-rejected request
+(`date_already_requested`), and the latest decision reason is returned with each
+request so employees see why a request was rejected.
 See `PAYROLL-DECISIONS.md` for worked examples and the ELT decisions required
 before attendance deductions and payable units can be implemented.
 

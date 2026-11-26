@@ -13,6 +13,6 @@ export async function portalIdentity(request: Request) {
   try {
     const { payload } = await jwtVerify(token,getKey,{issuer,audience:'authenticated',algorithms:['ES256','RS256'],requiredClaims:['exp','sub']})
     if (!payload.sub || payload.role !== 'authenticated' || payload.is_anonymous === true) throw Error()
-    return {authProvider:issuer,authSubject:payload.sub,aal:payload.aal==='aal2'?'aal2':'aal1'}
+    return {authProvider:issuer,authSubject:payload.sub,aal:payload.aal==='aal2'?'aal2':'aal1',email:typeof payload.email==='string'?payload.email:''}
   } catch { throw new HttpError(401,'invalid_session') }
 }

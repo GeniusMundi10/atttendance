@@ -7,11 +7,14 @@ import { fileURLToPath } from 'node:url';
 import {
   AccessDeniedError,
   AccessMfaRequiredError,
+  approveSignup,
   authorizeFaceRegistrationReset,
   authorizeReceiptRead,
   checkKioskEligibility,
   listActiveSiteAssignments,
   listReadableEmployees,
+  listSignupRequests,
+  requestSignup,
   resolveAuthenticatedSubject,
 } from './access.ts';
 import type { QueryClient } from './access.ts';
@@ -86,6 +89,9 @@ test('access decisions use active mapping and database reader scope', {
     await client.query(`SET search_path TO "${schema}"`);
     const migration = await readFile(fileURLToPath(new URL('./migrations/001_access.sql', import.meta.url)), 'utf8');
     await client.query(migration);
+    for (const file of ['002_employee_code.sql', '003_signup_requests.sql']) {
+      await client.query(await readFile(fileURLToPath(new URL('./migrations/' + file, import.meta.url)), 'utf8'));
+    }
 
     const employee = randomUUID();
     const manager = randomUUID();
@@ -127,6 +133,22 @@ test('access decisions use active mapping and database reader scope', {
     assert.deepEqual((await listReadableEmployees(client, managerActor)).map(e => e.employeeId).sort(), [employee, manager].sort());
     assert.equal((await listReadableEmployees(client, hrActor)).length, 4);
     await assert.rejects(resolveAuthenticatedSubject(client, { authProvider: 'wrong', authSubject: employee }), AccessDeniedError);
+
+    // Password sign-up: pending until HR approves, then a linked employee with a generated ELT code.
+    const newcomer = { authProvider: provider, authSubject: 'newcomer', email: 'new@example.invalid' };
+    assert.deepEqual(await requestSignup(client, newcomer, 'New Person'), { state: 'pending', operator: false });
+    await assert.rejects(resolveAuthenticatedSubject(client, newcomer), AccessDeniedError);
+    const [signup] = await listSignupRequests(client, hrActor);
+    assert.equal(signup?.displayName, 'New Person');
+    await assert.rejects(listSignupRequests(client, employeeActor), AccessDeniedError);
+    await assert.rejects(approveSignup(client, employeeActor, signup!.requestId), AccessDeniedError);
+    const approved = await approveSignup(client, hrActor, signup!.requestId);
+    assert.match(approved.employeeCode, /^ELT\d{5}$/);
+    assert.deepEqual(await approveSignup(client, hrActor, signup!.requestId), approved);
+    assert.equal((await resolveAuthenticatedSubject(client, newcomer)).employeeId, approved.employeeId);
+    assert.deepEqual(await requestSignup(client, newcomer, 'Ignored'), { state: 'approved', operator: false });
+    assert.deepEqual(await requestSignup(client, { authProvider: provider, authSubject: hr, email: 'hr@example.invalid' }, 'HR'), { state: 'approved', operator: true });
+    assert.deepEqual(await listSignupRequests(client, hrActor), []);
 
     await client.query('UPDATE access_employee_sites SET active = false WHERE employee_id = $1 AND site_id = $2', [employee, site]);
     await assert.rejects(checkKioskEligibility(client, { employeeId: employee, siteId: site }), AccessDeniedError);

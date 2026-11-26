@@ -1,6 +1,6 @@
 // PURPOSE: Verify self-service enrollment protocol behavior without real identities or production secrets.
 import assert from "node:assert/strict";
-import { generateKeyPairSync, randomBytes, randomUUID, sign } from "node:crypto";
+import { createCipheriv, generateKeyPairSync, randomBytes, randomUUID, sign } from "node:crypto";
 import { test } from "node:test";
 import {
   BiometricsError, claimFaceEnrollment, completeFaceEnrollment, generateEnrollmentCode, getFaceEnrollmentStatus,
@@ -31,8 +31,9 @@ test("portal status reports active assignments and registration readiness separa
   const client = {
     async query(sql: string) {
       if (sql.includes("SELECT s.id AS site_id")) return { rows: [{ site_id: siteId, site_name: "Synthetic Site" }] };
-      if (sql.includes("SELECT active FROM access_employees")) return { rows: [{ active: true }] };
-      if (sql.includes("FROM kiosk_face_registrations")) return { rows: [{ registration_revision: 4, template_id: null }] };
+      if (sql.includes("SELECT active, employee_code, display_name FROM access_employees")) return { rows: [{ active: true, employee_code: "ELT00007", display_name: "Synthetic Worker" }] };
+      if (sql.includes("FROM kiosk_face_registrations")) return { rows: [{ registration_revision: 4, template_id: null, approved_at: null }] };
+      if (sql.includes("FROM kiosk_face_reregistration_requests")) return { rows: [] };
       if (sql.includes("FROM kiosk_face_enrollment_requests") && sql.includes("state = 'issued'")) return { rows: [] };
       throw new Error("Unexpected status query");
     },
@@ -42,6 +43,13 @@ test("portal status reports active assignments and registration readiness separa
   assert.equal(status.registered, false);
   assert.deepEqual(status.eligibleSites, [{ siteId, siteName: "Synthetic Site" }]);
   assert.deepEqual(status.attendanceReadiness, { activeEmployee: true, activeSiteAssignmentCount: 1 });
+  assert.equal(status.employeeCode, "ELT00007");
+  assert.equal(status.displayName, "Synthetic Worker");
+  assert.equal(status.employeeId, employeeId);
+  // Not yet approved by HR: pending, and no code can be issued.
+  assert.equal(status.approvalPending, true);
+  assert.equal(status.registrationAvailable, false);
+  assert.equal(status.reregistrationRequested, false);
 });
 
 test("issuance returns plaintext once, persists only its site-bound digest, and recovers employee-bound idempotently", env({
@@ -54,10 +62,11 @@ test("issuance returns plaintext once, persists only its site-bound digest, and 
   const requestId = randomUUID();
   const persisted: unknown[][] = [];
   let recover = false;
+  let approved = false;
   const client = {
     async query(sql: string, values: unknown[] = []) {
       if (sql.includes("INSERT INTO kiosk_face_registrations")) return { rows: [], rowCount: 1 };
-      if (sql.includes("SELECT registration_revision, template_id")) return { rows: [{ registration_revision: 2, template_id: null }], rowCount: 1 };
+      if (sql.includes("SELECT registration_revision, template_id")) return { rows: [{ registration_revision: 2, template_id: null, approved_at: approved ? new Date() : null }], rowCount: 1 };
       if (sql.includes("SELECT employee_id,site_id,payload_hash,state,code_digest,expires_at")) return { rows: recover ? [{ employee_id: employeeId, site_id: siteId, payload_hash: values[0] === requestId ? (persisted[0]?.[4] ?? "") : "", state: "issued", code_digest: "not-returned", expires_at: new Date(Date.now() + 60_000), registration_revision: 2 }] : [], rowCount: recover ? 1 : 0 };
       if (sql.includes("FROM access_employees employee") && sql.includes("FOR SHARE")) return { rows: [{ id: employeeId }], rowCount: 1 };
       if (sql.includes("state = 'claimed' AND capture_expires_at")) return { rows: [], rowCount: 0 };
@@ -73,6 +82,8 @@ test("issuance returns plaintext once, persists only its site-bound digest, and 
     },
   } as unknown as QueryClient;
   const input = { employeeId, siteId, requestId, reissue: false };
+  await assert.rejects(issueFaceEnrollmentCode(client, input), failure("FACE_ENROLLMENT_APPROVAL_PENDING"));
+  approved = true;
   const issued = await issueFaceEnrollmentCode(client, input);
   assert.equal(issued.state, "issued");
   if (issued.state !== "issued") throw new Error("Expected issued state");
@@ -195,9 +206,13 @@ test("completion verifies consent and integrity, writes one encrypted template, 
     let storedEmbedding = "";
     let templateWrites = 0;
     let attendanceQueries = 0;
+    let others: Record<string, unknown>[] = [];
+    let cancelled = false;
     const client = {
       async query(sql: string, values: unknown[] = []) {
         if (sql.includes("attendance_")) { attendanceQueries++; throw new Error("Enrollment must not call attendance storage"); }
+        if (sql.includes("FROM kiosk_face_templates template")) return { rows: others, rowCount: others.length };
+        if (sql.includes("SET state = 'cancelled'")) { cancelled = true; return { rows: [], rowCount: 1 }; }
         if (sql.includes("FROM kiosk_biometric_devices")) return { rows: [{ site_id: siteId, public_key: publicKey.export({ format: "der", type: "spki" }).toString("base64url") }], rowCount: 1 };
         if (sql.includes("SELECT employee_id FROM kiosk_face_enrollment_requests WHERE claim_request_id")) return { rows: [{ employee_id: employeeId }], rowCount: 1 };
         if (sql.includes("INSERT INTO kiosk_face_registrations")) return { rows: [], rowCount: 1 };
@@ -231,6 +246,24 @@ test("completion verifies consent and integrity, writes one encrypted template, 
     assert.deepEqual(recovered, first);
     assert.equal(templateWrites, 1);
     assert.equal(attendanceQueries, 0);
+
+    // A second account presenting an already-registered face is refused by name and its session is spent.
+    const other = { employeeId: randomUUID(), siteId: randomUUID(), templateId: randomUUID() };
+    const iv = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", Buffer.from(process.env.KIOSK_TEMPLATE_KEY_HEX!, "hex"), iv);
+    cipher.setAAD(Buffer.from(`${other.siteId}/${other.employeeId}/${other.templateId}`, "utf8"));
+    const sealed = Buffer.concat([iv, cipher.update(JSON.stringify(embedding)), cipher.final(), cipher.getAuthTag()]).toString("base64url");
+    others = [{ template_id: other.templateId, site_id: other.siteId, employee_id: other.employeeId, sealed_embedding: sealed, display_name: "Asha Rao" }];
+    state = "claimed"; completedAt = null; completionRequestId = null; completionPayloadHash = null; registrationTemplate = null;
+    const retryId = randomUUID();
+    const retryToken = randomBytes(64).toString("base64url");
+    const retryPayload = JSON.stringify(["elt-enrollment-complete-v1", deviceId, claimRequestId, sessionId, retryId, issuedAt, "notice-v1", true, embedding, frames]);
+    payloads.set(retryToken, retryPayload);
+    const duplicate = await completeFaceEnrollment(client, { ...input, requestId: retryId, integrityToken: retryToken,
+      signature: sign("sha256", Buffer.from(signedIntegrityPayload(retryPayload, retryToken)), privateKey).toString("base64url") });
+    assert.deepEqual(duplicate, { state: "duplicate", registeredName: "Asha" });
+    assert.equal(cancelled, true);
+    assert.equal(templateWrites, 1);
   } finally {
     for (const [name, value] of Object.entries(previous)) value === undefined ? delete process.env[name] : process.env[name] = value;
   }
@@ -252,6 +285,7 @@ test("HR reset increments the global revision once and recovers only an identica
       if (sql.includes("FROM kiosk_face_registration_resets WHERE request_id")) return { rows: audit ? [audit] : [], rowCount: audit ? 1 : 0 };
       if (sql.includes("UPDATE kiosk_face_templates SET retired_at")) return { rows: [], rowCount: 1 };
       if (sql.includes("DELETE FROM kiosk_face_enrollment_codes")) return { rows: [], rowCount: 0 };
+      if (sql.includes("UPDATE kiosk_face_reregistration_requests SET resolved_at")) return { rows: [], rowCount: 1 };
       if (sql.includes("UPDATE kiosk_face_enrollment_requests SET state = 'cancelled'")) return { rows: [], rowCount: 1 };
       if (sql.includes("UPDATE kiosk_face_registrations")) {
         revision += 1;

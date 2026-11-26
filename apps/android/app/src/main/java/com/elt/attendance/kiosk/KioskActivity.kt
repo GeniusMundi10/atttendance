@@ -9,7 +9,12 @@ import android.content.ClipboardManager
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
+import android.text.SpannableStringBuilder
+import android.text.style.ForegroundColorSpan
+import android.text.style.ImageSpan
 import android.content.res.ColorStateList
 import android.view.Gravity
 import android.hardware.camera2.CameraCharacteristics
@@ -20,12 +25,16 @@ import android.text.InputType
 import android.text.InputFilter
 import android.view.View
 import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
@@ -49,12 +58,38 @@ internal class KioskActivity : ComponentActivity() {
     private val main = Handler(Looper.getMainLooper())
     private val inference = Executors.newSingleThreadExecutor()
     private val activeCapture = AtomicReference<FaceCapture?>()
+    private val activeSweep = AtomicReference<PoseSweep?>()
+    @Volatile private var roster: List<Template> = emptyList()
+    @Volatile private var trackingEnabled = false
+    private var lastTrack = 0L
+    private var trackFit = FaceGuideView.Fit.NONE
+    private var greetName: String? = null
+    private var autoCandidate: String? = null
+    private var autoSeenAt = 0L
+    private var lastAutoName: String? = null
+    private var lastAutoAt = 0L
+    private var shownGreeting: String? = null
+    private var sweepFit = FaceGuideView.Fit.NONE
+    private lateinit var cameraTitle: TextView
     private lateinit var config: KioskConfig
     private lateinit var pendingStore: PendingStore
     private lateinit var api: KioskApi
     private lateinit var play: PlayProof
     private lateinit var root: LinearLayout
+    private lateinit var page: LinearLayout
+    private lateinit var pageStatus: TextView
+    private lateinit var cameraLayer: FrameLayout
+    private lateinit var cameraCaption: LinearLayout
+    private lateinit var cameraPill: TextView
+    private lateinit var pillDot: GradientDrawable
+    private lateinit var faceGuide: FaceGuideView
+    private lateinit var sheet: LinearLayout
+    private lateinit var tools: LinearLayout
+    private lateinit var capturePanel: LinearLayout
+    private lateinit var captureHeading: TextView
+    private var acceptedSamples = 0
     private lateinit var status: TextView
+    private lateinit var receiptBanner: TextView
     private lateinit var viewfinder: PreviewView
     private lateinit var actions: LinearLayout
     private lateinit var checkIn: Button
@@ -69,12 +104,12 @@ internal class KioskActivity : ComponentActivity() {
     private lateinit var selfCodeInput: EditText
     private lateinit var selfConsent: CheckBox
     private lateinit var enrollmentEntry: LinearLayout
+    private lateinit var entryScroll: ScrollView
     private lateinit var enrollmentGuide: LinearLayout
     private lateinit var enrollmentGuideScroll: ScrollView
     private lateinit var enrollmentRecovery: LinearLayout
     private lateinit var enrollmentSuccess: LinearLayout
     private lateinit var enrollmentHeading: TextView
-    private lateinit var enrollmentSite: TextView
     private lateinit var enrollmentNotice: TextView
     private lateinit var enrollmentInstruction: TextView
     private lateinit var captureProgress: TextView
@@ -114,6 +149,7 @@ internal class KioskActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        SetupPolicy.allowLoopbackHttp = (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or WindowManager.LayoutParams.FLAG_SECURE)
         drawScreen()
         config = runCatching { KioskConfig.read(this) }.getOrNull() ?: run {
@@ -126,6 +162,7 @@ internal class KioskActivity : ComponentActivity() {
         }
 
 
+        if (config.mode == Mode.ENROLL) enroll.text = "Capture enrollment"
         codeInput.visibility = if (config.mode == Mode.ENROLL) View.VISIBLE else View.GONE
         consent.visibility = if (config.mode == Mode.ENROLL) View.VISIBLE else View.GONE
         pendingStore = PendingStore(applicationContext)
@@ -139,7 +176,7 @@ internal class KioskActivity : ComponentActivity() {
             val saved = pendingStore.read()
             if (saved == null && config.mode == Mode.KIOSK) {
                 // A failed warm-up can be retried when an employee starts a punch.
-                runCatching { play.prepare(); api.roster() }
+                runCatching { play.prepare(); roster = api.roster() }
             }
             onScreen {
                 pending = saved
@@ -173,6 +210,7 @@ internal class KioskActivity : ComponentActivity() {
 
     override fun onStop() {
         visible = false
+        activeSweep.set(null)
         if (activeCapture.getAndSet(null) != null) finishFlow("Camera capture stopped.")
         if (::enrollmentStore.isInitialized && config.mode == Mode.KIOSK && enrollmentReference != null &&
             enrollmentUi != EnrollmentUi.SUCCESS && enrollmentUi != EnrollmentUi.IDLE) {
@@ -188,6 +226,7 @@ internal class KioskActivity : ComponentActivity() {
 
     override fun onDestroy() {
         activeCapture.set(null)
+        activeSweep.set(null)
         camera?.unbindAll()
         inference.execute { engine?.close() }
         inference.shutdown()
@@ -196,69 +235,99 @@ internal class KioskActivity : ComponentActivity() {
     }
 
     private fun drawScreen() {
-        val spacing = (16 * resources.displayMetrics.density).toInt()
-        val ink = Color.rgb(26, 25, 23)
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(spacing, spacing, spacing, spacing)
-            setOnApplyWindowInsetsListener { view, insets ->
-                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
-                view.setPadding(spacing + bars.left, spacing + bars.top, spacing + bars.right, spacing + bars.bottom)
-                insets
-            }
+            background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(Palette.peachTop, Palette.peachBottom))
         }
-        root.addView(ImageView(this).apply {
-            setImageResource(com.elt.attendance.kiosk.R.drawable.elt_logo)
-            scaleType = ImageView.ScaleType.FIT_START
-            contentDescription = "ELT Corporate"
-        }, LinearLayout.LayoutParams(-1, (72 * resources.displayMetrics.density).toInt()))
-        root.addView(TextView(this).apply {
-            text = "Attendance"
-            textSize = 31f
-            setTextColor(ink)
-            setTypeface(typeface, Typeface.BOLD)
-            letterSpacing = -.035f
-        })
-        status = TextView(this).apply {
-            textSize = 15f
-            setTextColor(Color.rgb(102, 97, 90))
-            setPadding(0, spacing / 2, 0, spacing)
-            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-        }
-        root.addView(status, LinearLayout.LayoutParams(-1, -2))
+        val content = FrameLayout(this)
+        root.addView(content, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        // Camera home: full-bleed preview, face oval, camera state pill, and the live status over a scrim.
+        cameraLayer = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         viewfinder = PreviewView(this).apply {
-            setBackgroundColor(Color.BLACK)
-            scaleType = PreviewView.ScaleType.FIT_CENTER
+            scaleType = PreviewView.ScaleType.FILL_CENTER
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-            background = GradientDrawable().apply {
-                setColor(Color.BLACK)
-                cornerRadius = spacing.toFloat()
-            }
-            clipToOutline = true
         }
-        root.addView(viewfinder, LinearLayout.LayoutParams(-1, 0, 1f).apply { bottomMargin = spacing })
-        enrollmentEntry = LinearLayout(this).apply {
+        cameraLayer.addView(viewfinder, FrameLayout.LayoutParams(-1, -1))
+        faceGuide = FaceGuideView(this)
+        cameraLayer.addView(faceGuide, FrameLayout.LayoutParams(-1, -1))
+        pillDot = oval(Palette.idleDot, dp(10))
+        cameraPill = label(size = 14f, color = Color.WHITE).apply {
+            background = rounded(Color.argb(110, 0, 0, 0), dp(18).toFloat())
+            setPadding(dp(12), dp(7), dp(14), dp(7))
+            compoundDrawablePadding = dp(8)
+            setCompoundDrawablesRelativeWithIntrinsicBounds(pillDot, null, null, null)
+        }
+        cameraLayer.addView(cameraPill, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply { marginEnd = dp(16) })
+        cameraCaption = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            background = GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP, intArrayOf(Color.argb(175, 0, 0, 0), Color.TRANSPARENT))
+            setPadding(dp(24), dp(64), dp(24), dp(48))
+        }
+        // Committed punch receipt: solid and large so it reads over any camera image.
+        receiptBanner = label(size = 18f, color = Color.WHITE, bold = true).apply {
+            background = rounded(Palette.green, dp(16).toFloat())
+            setPadding(dp(18), dp(12), dp(18), dp(12))
+            visibility = View.GONE
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_ASSERTIVE
+        }
+        cameraCaption.add(receiptBanner)
+        cameraTitle = label("Position your face in the frame", 24f, Color.WHITE, bold = true)
+        cameraCaption.add(cameraTitle, top = 12)
+        status = label(size = 16f, color = Color.WHITE).apply {
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        cameraCaption.add(status, top = 6)
+        cameraLayer.addView(cameraCaption, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+        content.addView(cameraLayer, FrameLayout.LayoutParams(-1, -1))
+
+        // Page: every non-camera screen (setup, code entry, notice, recovery, success) on the warm background.
+        page = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
             visibility = View.GONE
         }
-        enrollmentEntry.addView(TextView(this).apply {
-            text = "Enter your six-digit code"
-            textSize = 21f
-            setTextColor(ink)
-            setTypeface(typeface, Typeface.BOLD)
-        }, LinearLayout.LayoutParams(-1, -2))
+        page.add(label(size = 20f, bold = true).apply {
+            text = SpannableStringBuilder().append("ELT", ForegroundColorSpan(Palette.orange), 0).append(" Attendance")
+        })
+        pageStatus = label(size = 14f, color = Palette.muted).apply {
+            setPadding(0, dp(6), 0, dp(14))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        page.add(pageStatus)
+        content.addView(page, FrameLayout.LayoutParams(-1, -1))
+
+        enrollmentEntry = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            visibility = View.GONE
+        }
+        enrollmentEntry.add(iconCircle(FingerprintDrawable(Palette.orange, dp(36)), dp(72), Palette.orangeSoft), dp(72), dp(72))
+        enrollmentEntry.add(label("Set up biometric", 15f, Palette.muted), top = 8)
+        enrollmentEntry.add(label("Enter your six-digit code", 26f, bold = true), top = 4)
+        enrollmentEntry.add(label("Get your code in Attendance", 15f, Palette.muted), top = 4)
         selfCodeInput = EditText(this).apply {
-            hint = "Six-digit code"
+            hint = "––––––"
             inputType = InputType.TYPE_CLASS_NUMBER
             filters = arrayOf<InputFilter>(android.text.method.DigitsKeyListener.getInstance("0123456789"), InputFilter.LengthFilter(6))
             importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
             isSaveEnabled = false
             isSingleLine = true
             contentDescription = "Six-digit face enrollment code"
+            // The on-screen keypad below replaces the system keyboard; paste and hardware keys still work.
+            showSoftInputOnFocus = false
+            textSize = 32f
+            letterSpacing = .25f
+            gravity = Gravity.CENTER
+            setTypeface(Typeface.DEFAULT_BOLD)
+            setTextColor(Palette.ink)
+            setHintTextColor(Palette.line)
+            background = rounded(Color.WHITE, dp(18).toFloat(), Palette.line, dp(1))
         }
-        enrollmentEntry.addView(selfCodeInput, LinearLayout.LayoutParams(-1, -2))
-        continueEnrollment = button("Continue") { continueSelfServiceEnrollment() }
+        enrollmentEntry.add(selfCodeInput, height = dp(68), top = 16)
+        continueEnrollment = button("Continue", Look.PRIMARY) { continueSelfServiceEnrollment() }
         cancelEnrollmentButton = button("Cancel") { cancelSelfServiceEnrollment() }
         selfCodeInput.addTextChangedListener(object : android.text.TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
@@ -267,116 +336,166 @@ internal class KioskActivity : ComponentActivity() {
                 continueEnrollment.isEnabled = !busy && EnrollmentPolicy.validCode(s?.toString().orEmpty())
             }
         })
-        enrollmentEntry.addView(continueEnrollment, LinearLayout.LayoutParams(-1, -2))
-        enrollmentEntry.addView(cancelEnrollmentButton, LinearLayout.LayoutParams(-1, -2))
-        root.addView(enrollmentEntry, LinearLayout.LayoutParams(-1, -2))
+        enrollmentEntry.add(continueEnrollment, top = 12)
+        enrollmentEntry.add(cancelEnrollmentButton, top = 8)
+        enrollmentEntry.add(keypad(), top = 8)
+        entryScroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            addView(enrollmentEntry)
+        }
+        page.addView(entryScroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        enrollmentGuide = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-        }
-        enrollmentHeading = TextView(this).apply {
-            textSize = 22f
-            setTextColor(ink)
-            setTypeface(typeface, Typeface.BOLD)
-        }
-        enrollmentSite = TextView(this).apply { textSize = 16f; setTextColor(ink) }
-        enrollmentNotice = TextView(this).apply {
-            textSize = 15f
-            setTextColor(ink)
-            setPadding(0, spacing / 2, 0, spacing / 2)
+        enrollmentGuide = card()
+        val art = FrameLayout(this)
+        art.addView(iconCircle(IconDrawable(Icons.PERSON, Color.rgb(88, 84, 80), dp(72)), dp(136), Palette.orangeSoft),
+            FrameLayout.LayoutParams(dp(136), dp(136), Gravity.CENTER))
+        art.addView(iconCircle(IconDrawable(Icons.CAMERA_OFF, Palette.orange, dp(26)), dp(52), Palette.orangeSoft).apply {
+            background = oval(Palette.orangeSoft).apply { setStroke(dp(4), Color.WHITE) }
+        }, FrameLayout.LayoutParams(dp(52), dp(52), Gravity.BOTTOM or Gravity.END))
+        enrollmentGuide.add(art, dp(150), dp(150))
+        enrollmentHeading = label(size = 26f, bold = true)
+        enrollmentGuide.add(enrollmentHeading, top = 18)
+        enrollmentGuide.add(label("Used to verify attendance. Camera frames are not saved.", 16f, Palette.muted), top = 8)
+        enrollmentGuide.add(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = rounded(Palette.orangeSoft, dp(16).toFloat())
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            addView(ImageView(this@KioskActivity).apply {
+                setImageDrawable(IconDrawable(Icons.INFO, Palette.orange, dp(24)))
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }, LinearLayout.LayoutParams(dp(24), dp(24)))
+            addView(label("Registration does not create attendance.", 15f, center = false),
+                LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(12) })
+        }, top = 18)
+        // The server's approved notice must be readable before the employee agrees.
+        enrollmentNotice = label(size = 14f, color = Palette.muted, center = false).apply {
+            background = rounded(Color.rgb(250, 247, 245), dp(14).toFloat(), Palette.line, dp(1))
+            setPadding(dp(14), dp(12), dp(14), dp(12))
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
         }
+        enrollmentGuide.add(enrollmentNotice, top = 12)
+        // Agreement is the "Agree and start camera" tap; the box only carries that state into capture.
         selfConsent = CheckBox(this).apply {
-            textSize = 15f
+            visibility = View.GONE
             setOnCheckedChangeListener { _, _ -> render() }
         }
-        enrollmentInstruction = TextView(this).apply {
-            textSize = 16f
-            setTextColor(ink)
-            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        enrollmentGuide.add(selfConsent)
+        startEnrollmentCapture = button("Agree and start camera", Look.PRIMARY) {
+            selfConsent.isChecked = true
+            startSelfServiceCapture()
         }
-        captureProgress = TextView(this).apply {
-            textSize = 15f
-            setTextColor(Color.rgb(102, 97, 90))
-            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-        }
-        startEnrollmentCapture = button("Agree and start camera") { startSelfServiceCapture() }
-        val cancelGuide = button("Cancel") { cancelSelfServiceEnrollment() }
-        enrollmentGuide.addView(enrollmentHeading, LinearLayout.LayoutParams(-1, -2))
-        enrollmentGuide.addView(enrollmentSite, LinearLayout.LayoutParams(-1, -2))
-        enrollmentGuide.addView(enrollmentNotice, LinearLayout.LayoutParams(-1, -2))
-        enrollmentGuide.addView(selfConsent, LinearLayout.LayoutParams(-1, -2))
-        enrollmentGuide.addView(enrollmentInstruction, LinearLayout.LayoutParams(-1, -2))
-        enrollmentGuide.addView(captureProgress, LinearLayout.LayoutParams(-1, -2))
-        enrollmentGuide.addView(startEnrollmentCapture, LinearLayout.LayoutParams(-1, -2))
-        enrollmentGuide.addView(cancelGuide, LinearLayout.LayoutParams(-1, -2))
+        enrollmentGuide.add(startEnrollmentCapture, top = 20)
+        enrollmentGuide.add(button("Cancel") { cancelSelfServiceEnrollment() }, top = 10)
         enrollmentGuideScroll = ScrollView(this).apply {
-            isFillViewport = true
             visibility = View.GONE
+            isVerticalScrollBarEnabled = false
             addView(enrollmentGuide)
         }
-        root.addView(enrollmentGuideScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        page.addView(enrollmentGuideScroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        enrollmentRecovery = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-        }
-        recoveryText = TextView(this).apply { textSize = 16f; setTextColor(ink) }
-        retryEnrollmentStatus = button("Check registration status") { retryEnrollmentRecovery() }
+        enrollmentRecovery = card().apply { visibility = View.GONE }
+        enrollmentRecovery.add(ProgressBar(this).apply { indeterminateTintList = ColorStateList.valueOf(Palette.orange) }, dp(44), dp(44))
+        recoveryText = label(size = 17f)
+        enrollmentRecovery.add(recoveryText, top = 16)
+        retryEnrollmentStatus = button("Check registration status", Look.PRIMARY) { retryEnrollmentRecovery() }
         cancelRecoveredEnrollment = button("Cancel enrollment") { cancelSelfServiceEnrollment() }
-        enrollmentRecovery.addView(recoveryText, LinearLayout.LayoutParams(-1, -2))
-        enrollmentRecovery.addView(retryEnrollmentStatus, LinearLayout.LayoutParams(-1, -2))
-        enrollmentRecovery.addView(cancelRecoveredEnrollment, LinearLayout.LayoutParams(-1, -2))
-        root.addView(enrollmentRecovery, LinearLayout.LayoutParams(-1, -2))
+        enrollmentRecovery.add(retryEnrollmentStatus, top = 20)
+        enrollmentRecovery.add(cancelRecoveredEnrollment, top = 10)
+        page.add(enrollmentRecovery)
 
-        enrollmentSuccess = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-        }
-        successText = TextView(this).apply {
-            textSize = 19f
-            setTextColor(ink)
+        enrollmentSuccess = card().apply { visibility = View.GONE }
+        enrollmentSuccess.add(FrameLayout(this).apply {
+            background = oval(Palette.orangeSoft)
+            addView(ImageView(this@KioskActivity).apply {
+                setImageDrawable(IconDrawable(Icons.CHECK, Color.WHITE, dp(44)))
+                background = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(Palette.orangeLight, Palette.orange))
+                    .apply { shape = GradientDrawable.OVAL }
+                setPadding(dp(24), dp(24), dp(24), dp(24))
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }, FrameLayout.LayoutParams(dp(92), dp(92), Gravity.CENTER))
+        }, dp(128), dp(128))
+        enrollmentSuccess.add(label("Registered", 14f, Palette.green, bold = true).apply {
+            background = rounded(Palette.greenSoft, dp(16).toFloat())
+            setPadding(dp(12), dp(6), dp(14), dp(6))
+            compoundDrawablePadding = dp(8)
+            setCompoundDrawablesRelativeWithIntrinsicBounds(oval(Palette.green, dp(10)), null, null, null)
+        }, width = -2, top = 20)
+        enrollmentSuccess.add(label("Face registered", 30f, bold = true), top = 12)
+        successText = label(size = 16f, color = Palette.muted).apply {
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
-        checkInAfterEnrollment = button("Check in") { beginCheckInAfterEnrollment() }
+        enrollmentSuccess.add(successText, top = 6)
+        enrollmentSuccess.add(View(this).apply { setBackgroundColor(Palette.line) }, height = dp(1), top = 22)
+        enrollmentSuccess.add(label("What would you like to do next?", 17f), top = 20)
+        checkInAfterEnrollment = button("Check in  →", Look.PRIMARY) { beginCheckInAfterEnrollment() }
         finishEnrollment = button("Finish") { finishSelfServiceEnrollment() }
-        enrollmentSuccess.addView(successText, LinearLayout.LayoutParams(-1, -2))
-        enrollmentSuccess.addView(checkInAfterEnrollment, LinearLayout.LayoutParams(-1, -2))
-        enrollmentSuccess.addView(finishEnrollment, LinearLayout.LayoutParams(-1, -2))
-        root.addView(enrollmentSuccess, LinearLayout.LayoutParams(-1, -2))
+        enrollmentSuccess.add(checkInAfterEnrollment, top = 16)
+        enrollmentSuccess.add(finishEnrollment, top = 10)
+        page.add(enrollmentSuccess)
 
+        // Bottom sheet: punch tiles, biometric setup, capture progress, and the quieter admin links.
+        sheet = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val r = dp(28).toFloat()
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE)
+                cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+            }
+            elevation = dp(8).toFloat()
+        }
         actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        checkIn = button("Check in") { begin(Action.IN) }.apply {
-            backgroundTintList = ColorStateList.valueOf(ink)
-            setTextColor(Color.WHITE)
+        checkIn = tile("Check in", Icons.LOGIN) { begin(Action.IN) }
+        checkOut = tile("Check out", Icons.LOGOUT) { begin(Action.OUT) }
+        actions.addView(checkIn, LinearLayout.LayoutParams(0, dp(118), 1f))
+        actions.addView(checkOut, LinearLayout.LayoutParams(0, dp(118), 1f).apply { marginStart = dp(12) })
+        sheet.add(actions)
+        enroll = button("", Look.OUTLINE) {
+            if (::config.isInitialized && config.mode == Mode.KIOSK) openSelfServiceEnrollment() else beginEnrollment()
+        }.apply {
+            text = SpannableStringBuilder().append("  ", ImageSpan(IconDrawable(Icons.PERSON, Palette.orange, dp(24)).apply {
+                setBounds(0, 0, dp(24), dp(24))
+            }, ImageSpan.ALIGN_CENTER), 0).append("  Set up biometric")
+            contentDescription = "Set up biometric"
         }
-        checkOut = button("Check out") { begin(Action.OUT) }.apply {
-            backgroundTintList = ColorStateList.valueOf(Color.rgb(234, 230, 222))
-            setTextColor(ink)
-        }
-        actions.addView(checkIn, LinearLayout.LayoutParams(0, -2, 1f))
-        actions.addView(checkOut, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = spacing / 2 })
-        root.addView(actions)
-        codeInput = EditText(this).apply {
-            hint = "One-time enrollment code"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
-            isSaveEnabled = false
+        sheet.add(enroll, top = 12)
+
+        capturePanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
             visibility = View.GONE
         }
-        root.addView(codeInput, LinearLayout.LayoutParams(-1, -2))
+        captureHeading = label(size = 24f, bold = true)
+        // The step instruction sits on the camera as a caption pill below the oval, clear of the drawn gestures.
+        enrollmentInstruction = label(size = 22f, color = Color.WHITE, bold = true).apply {
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            background = rounded(Color.argb(140, 0, 0, 0), dp(24).toFloat())
+            setPadding(dp(20), dp(10), dp(20), dp(10))
+            visibility = View.GONE
+        }
+        cameraLayer.addView(enrollmentInstruction, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+            .apply { bottomMargin = dp(52) })
+        capturePanel.add(captureHeading)
+        captureProgress = label(size = 15f, color = Palette.muted).apply {
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        capturePanel.add(captureProgress, top = 10)
+        capturePanel.add(button("Cancel") { cancelSelfServiceEnrollment() }, top = 16)
+        sheet.add(capturePanel)
+
+        codeInput = setupField("One-time enrollment code", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD).apply {
+            visibility = View.GONE
+        }
+        sheet.add(codeInput, top = 12)
         consent = CheckBox(this).apply {
             text = "I confirmed the employee completed ELT’s approved biometric notice and consent process."
             visibility = View.GONE
         }
-        root.addView(consent, LinearLayout.LayoutParams(-1, -2))
-        enroll = button("Capture enrollment") {
-            if (::config.isInitialized && config.mode == Mode.KIOSK) openSelfServiceEnrollment() else beginEnrollment()
-        }
-        retry = button("Retry pending punch") { retryPunch() }
-        selfTest = button("Test camera") { beginDiagnostic() }
-        returnToSetup = button("Back to device setup") {
+        sheet.add(consent, top = 8)
+        retry = button("Retry pending punch", Look.PRIMARY) { retryPunch() }
+        sheet.add(retry, top = 12)
+        selfTest = button("Test camera", Look.LINK) { beginDiagnostic() }
+        returnToSetup = button("Back to device setup", Look.LINK) {
             localTestMode = false
             camera?.unbindAll()
             camera = null
@@ -385,30 +504,146 @@ internal class KioskActivity : ComponentActivity() {
             selfTest.visibility = View.GONE
             returnToSetup.visibility = View.GONE
             firstRunPanel?.visibility = View.VISIBLE
-            viewfinder.visibility = View.GONE
+            cameraLayer.visibility = View.GONE
             message("Set up this device to connect attendance, or repeat the local camera test.")
         }.apply { visibility = View.GONE }
-        admin = button("Device administrator setup") { showAdminDialog() }.apply { visibility = View.GONE }
-        root.addView(enroll, LinearLayout.LayoutParams(-1, -2))
-        root.addView(retry, LinearLayout.LayoutParams(-1, -2))
-        root.addView(selfTest, LinearLayout.LayoutParams(-1, -2))
-        root.addView(returnToSetup, LinearLayout.LayoutParams(-1, -2))
-        root.addView(admin, LinearLayout.LayoutParams(-1, -2))
+        admin = button("Device admin", Look.LINK) { showAdminDialog() }.apply { visibility = View.GONE }
+        tools = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            addView(selfTest)
+            addView(returnToSetup)
+            addView(admin)
+        }
+        sheet.add(tools, top = 4)
+        root.addView(sheet, LinearLayout.LayoutParams(-1, -2).apply { topMargin = -dp(28) })
+
+        root.setOnApplyWindowInsetsListener { _, insets ->
+            val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+            page.setPadding(dp(20) + bars.left, dp(16) + bars.top, dp(20) + bars.right, dp(36) + bars.bottom)
+            (cameraPill.layoutParams as FrameLayout.LayoutParams).topMargin = dp(12) + bars.top
+            cameraPill.requestLayout()
+            sheet.setPadding(dp(20) + bars.left, dp(22), dp(20) + bars.right, dp(12) + bars.bottom)
+            insets
+        }
         setContentView(root)
         render()
     }
 
-    private fun button(label: String, action: () -> Unit): Button = Button(this).apply {
+    private enum class Look { PRIMARY, SECONDARY, OUTLINE, LINK, KEY }
+
+    private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+
+    private fun states(enabled: Int, disabled: Int) =
+        ColorStateList(arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()), intArrayOf(disabled, enabled))
+
+    private fun button(label: String, look: Look = Look.SECONDARY, action: () -> Unit): Button = Button(this).apply {
         text = label
-        textSize = 15f
         isAllCaps = false
-        minHeight = (52 * resources.displayMetrics.density).toInt()
+        stateListAnimator = null
         gravity = Gravity.CENTER
+        minHeight = dp(if (look == Look.LINK) 44 else 56)
+        minimumHeight = minHeight
+        textSize = when (look) { Look.LINK -> 14f; Look.KEY -> 26f; else -> 17f }
+        setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
+        val fill = GradientDrawable().apply { cornerRadius = dp(if (look == Look.KEY) 18 else 28).toFloat() }
+        when (look) {
+            Look.PRIMARY -> {
+                fill.setColor(states(Palette.orange, Palette.orangeDisabled))
+                setTextColor(Color.WHITE)
+                setTypeface(Typeface.DEFAULT_BOLD)
+            }
+            Look.SECONDARY -> {
+                fill.setColor(ColorStateList.valueOf(Color.WHITE))
+                fill.setStroke(dp(1), Palette.line)
+                setTextColor(states(Palette.ink, Palette.idleDot))
+            }
+            Look.OUTLINE -> {
+                fill.setColor(ColorStateList.valueOf(Color.WHITE))
+                fill.setStroke(dp(2), states(Palette.orange, Palette.orangeDisabled))
+                setTextColor(states(Palette.orange, Palette.orangeDisabled))
+                setTypeface(Typeface.DEFAULT_BOLD)
+            }
+            Look.KEY -> {
+                fill.setColor(ColorStateList.valueOf(Color.argb(200, 255, 255, 255)))
+                setTextColor(Palette.ink)
+            }
+            Look.LINK -> {
+                fill.setColor(ColorStateList.valueOf(Color.TRANSPARENT))
+                setTextColor(states(Palette.muted, Palette.idleDot))
+                setPadding(dp(14), 0, dp(14), 0)
+            }
+        }
+        background = RippleDrawable(ColorStateList.valueOf(Color.argb(34, 0, 0, 0)), fill, null)
         setOnClickListener { action() }
     }
 
+    private fun tile(label: String, icon: String, action: () -> Unit) = button(label, Look.PRIMARY, action).apply {
+        textSize = 19f
+        setCompoundDrawablesRelativeWithIntrinsicBounds(null, IconDrawable(icon, Color.WHITE, dp(38)), null, null)
+        compoundDrawablePadding = dp(8)
+        background = RippleDrawable(ColorStateList.valueOf(Color.argb(40, 0, 0, 0)), GradientDrawable().apply {
+            cornerRadius = dp(22).toFloat()
+            setColor(states(Palette.orange, Palette.orangeDisabled))
+        }, null)
+    }
+
+    private fun keypad() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        for (row in listOf("123", "456", "789", " 0<")) {
+            addView(LinearLayout(this@KioskActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                for (key in row) {
+                    val view: View = when (key) {
+                        ' ' -> View(this@KioskActivity)
+                        '<' -> ImageButton(this@KioskActivity).apply {
+                            setImageDrawable(IconDrawable(Icons.BACKSPACE, Palette.ink, dp(26)))
+                            background = RippleDrawable(ColorStateList.valueOf(Color.argb(34, 0, 0, 0)),
+                                rounded(Color.argb(200, 255, 255, 255), dp(18).toFloat()), null)
+                            contentDescription = "Delete last digit"
+                            setOnClickListener { selfCodeInput.text.let { if (it.isNotEmpty()) it.delete(it.length - 1, it.length) } }
+                        }
+                        else -> button(key.toString(), Look.KEY) { selfCodeInput.text.append(key) }
+                    }
+                    addView(view, LinearLayout.LayoutParams(0, dp(54), 1f).apply { setMargins(dp(5), dp(4), dp(5), dp(4)) })
+                }
+            }, LinearLayout.LayoutParams(-1, -2))
+        }
+    }
+
+    private fun label(value: String = "", size: Float, color: Int = Palette.ink, bold: Boolean = false, center: Boolean = true) =
+        TextView(this).apply {
+            text = value
+            textSize = size
+            setTextColor(color)
+            if (bold) {
+                setTypeface(Typeface.DEFAULT_BOLD)
+                letterSpacing = -.02f
+            }
+            if (center) gravity = Gravity.CENTER_HORIZONTAL
+        }
+
+    private fun card() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER_HORIZONTAL
+        background = rounded(Color.WHITE, dp(28).toFloat())
+        elevation = dp(2).toFloat()
+        setPadding(dp(24), dp(28), dp(24), dp(24))
+    }
+
+    private fun iconCircle(icon: Drawable, size: Int, fill: Int) = ImageView(this).apply {
+        setImageDrawable(icon)
+        background = oval(fill)
+        val inset = size / 4
+        setPadding(inset, inset, inset, inset)
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+    }
+
+    private fun LinearLayout.add(view: View, width: Int = -1, height: Int = -2, top: Int = 0) =
+        addView(view, LinearLayout.LayoutParams(width, height).apply { topMargin = dp(top) })
+
     private fun showFirstRunSetup() {
-        viewfinder.visibility = View.GONE
+        cameraLayer.visibility = View.GONE
         actions.visibility = View.GONE
         codeInput.visibility = View.GONE
         consent.visibility = View.GONE
@@ -422,23 +657,18 @@ internal class KioskActivity : ComponentActivity() {
             val spacing = (12 * resources.displayMetrics.density).toInt()
             setPadding(0, spacing, 0, spacing)
         }
-        panel.addView(TextView(this).apply {
-            text = "Unmanaged device setup"
-            textSize = 20f
-        })
-        panel.addView(TextView(this).apply {
-            text = "Enter ELT’s HTTPS attendance service and linked Play Integrity project. This phone will create its own hardware-backed device key."
-            textSize = 15f
-        })
+        panel.add(label("Device setup", 26f, bold = true, center = false))
+        panel.add(label("Enter ELT’s HTTPS attendance service and linked Play Integrity project. This phone will create its own hardware-backed device key.",
+            15f, Palette.muted, center = false), top = 6)
         val origin = setupField("HTTPS attendance server origin", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
         val project = setupField("Play Integrity cloud project number", InputType.TYPE_CLASS_NUMBER)
         val pin = setupField("Create 8–12 digit device admin PIN", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD)
         val confirmation = setupField("Confirm device admin PIN", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD)
-        panel.addView(origin, LinearLayout.LayoutParams(-1, -2))
-        panel.addView(project, LinearLayout.LayoutParams(-1, -2))
-        panel.addView(pin, LinearLayout.LayoutParams(-1, -2))
-        panel.addView(confirmation, LinearLayout.LayoutParams(-1, -2))
-        panel.addView(button("Save setup and create device key") {
+        panel.add(origin, top = 12)
+        panel.add(project, top = 12)
+        panel.add(pin, top = 12)
+        panel.add(confirmation, top = 12)
+        panel.add(button("Save setup and create device key", Look.PRIMARY) {
             val originValue = origin.text.toString()
             val projectValue = project.text.toString()
             val pinValue = pin.text.toString().toCharArray()
@@ -473,21 +703,24 @@ internal class KioskActivity : ComponentActivity() {
                     confirmationValue.fill('\u0000')
                 }
             }
-        }, LinearLayout.LayoutParams(-1, -2))
-        panel.addView(button("Test camera and liveness only (no record)") { startLocalCameraTest() }, LinearLayout.LayoutParams(-1, -2))
+        }, top = 20)
+        panel.add(button("Test camera and liveness only (no record)") { startLocalCameraTest() }, top = 10)
 
         val scroll = ScrollView(this).apply {
             isFillViewport = true
             addView(panel)
         }
         firstRunPanel = scroll
-        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        page.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         message("No managed setup is required. Set up the phone here, or run a local camera test first.")
     }
 
     private fun setupField(hintText: String, type: Int) = EditText(this).apply {
         hint = hintText
         inputType = type
+        textSize = 16f
+        background = rounded(Color.WHITE, dp(14).toFloat(), Palette.line, dp(1))
+        setPadding(dp(16), dp(14), dp(16), dp(14))
         isSaveEnabled = false
         importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
     }
@@ -495,7 +728,7 @@ internal class KioskActivity : ComponentActivity() {
     private fun startLocalCameraTest() {
         localTestMode = true
         firstRunPanel?.visibility = View.GONE
-        viewfinder.visibility = View.VISIBLE
+        cameraLayer.visibility = View.VISIBLE
         selfTest.visibility = View.VISIBLE
         returnToSetup.visibility = View.VISIBLE
         usable = true
@@ -579,7 +812,7 @@ internal class KioskActivity : ComponentActivity() {
     }
 
     private fun showProvisioning() {
-        viewfinder.visibility = View.GONE
+        cameraLayer.visibility = View.GONE
         actions.visibility = View.GONE
         codeInput.visibility = View.GONE
         consent.visibility = View.GONE
@@ -593,21 +826,21 @@ internal class KioskActivity : ComponentActivity() {
         submit {
             val key = DeviceSigner(config.deviceId, true).publicKey()
             onScreen {
-                root.addView(TextView(this).apply {
-                    text = "Device ID: ${config.deviceId}\n\nRegister this ID and public key against an active ELT site using the trusted operator provisioning command. Do not enter a site ID supplied by an unverified source."
+                page.add(TextView(this).apply {
+                    text = "Device ID: ${config.deviceId}\n\nPublic key: $key\n\nRegister this ID and public key against an active ELT site using the trusted operator provisioning command. Do not enter a site ID supplied by an unverified source."
                     textSize = 15f
-                }, LinearLayout.LayoutParams(-1, -2))
-                root.addView(button("Copy this device ID") {
+                }, top = 12)
+                page.add(button("Copy this device ID") {
                     getSystemService(ClipboardManager::class.java).setPrimaryClip(
                         ClipData.newPlainText("Kiosk device ID", config.deviceId)
                     )
                     message("Device ID copied. Keep it with the supervised device-registration request.")
-                }, LinearLayout.LayoutParams(-1, -2))
-                root.addView(button("Copy this device’s public key") {
+                }, top = 12)
+                page.add(button("Copy this device’s public key") {
                     val clipboard = getSystemService(ClipboardManager::class.java)
                     clipboard.setPrimaryClip(ClipData.newPlainText("Kiosk public key", key))
                     message("Public key copied. Register it for this device and its assigned site.")
-                }, LinearLayout.LayoutParams(-1, -2))
+                }, top = 12)
                 message("This device key is ready. Site registration is an operator-controlled step; no MDM is needed.")
             }
         }
@@ -666,7 +899,7 @@ internal class KioskActivity : ComponentActivity() {
         val currentFlow = startFlow("Connecting to attendance…")
         submit(currentFlow) {
             play.prepare()
-            val roster = api.roster()
+            val roster = api.roster().also { this.roster = it }
             if (roster.isEmpty()) throw CaptureRejected("No active faces are enrolled for this site.")
             val challenge = api.challenge(action)
             onScreen { startCapture(currentFlow, CapturePurpose.Punch(action, challenge, roster)) }
@@ -708,7 +941,7 @@ internal class KioskActivity : ComponentActivity() {
         activeEnrollmentClaim = null
         selfCodeInput.setText("")
         enrollmentUi = EnrollmentUi.ENTRY
-        viewfinder.visibility = View.GONE
+        cameraLayer.visibility = View.GONE
         message("Enter the six-digit code from the employee’s Attendance app.")
         selfCodeInput.requestFocus()
     }
@@ -748,7 +981,7 @@ internal class KioskActivity : ComponentActivity() {
                         cancellationRequested = false
                         clearGuideIdentity()
                         enrollmentUi = EnrollmentUi.ENTRY
-                        finishEnrollmentFlow("This code didn’t work. Check the six digits and your site, or get a new code in Attendance.")
+                        finishEnrollmentFlow("This code didn’t work. Check the six digits and your site, or tap Regenerate code in the Attendance app.")
                     }
                 } else {
                     resolveClaimFailure(reference, failure)
@@ -768,8 +1001,7 @@ internal class KioskActivity : ComponentActivity() {
                 requestEnrollmentCancellation("Enrollment was cancelled when the screen left the kiosk.")
             } else if (currentFlow == null || flow == currentFlow) {
                 enrollmentUi = EnrollmentUi.GUIDE
-                enrollmentHeading.text = "Register your face for ${claim.employeeFirstName}"
-                enrollmentSite.text = "Site: ${claim.siteName}"
+                enrollmentHeading.text = "Register your face for ${claim.employeeFirstName} at ${claim.siteName}"
                 enrollmentNotice.text = "Notice · version ${claim.notice.version}\n\n${claim.notice.text}"
                 selfConsent.text = "I have read and agree to this notice (version ${claim.notice.version})."
                 selfConsent.isChecked = false
@@ -855,8 +1087,7 @@ internal class KioskActivity : ComponentActivity() {
                     onScreen {
                         activeEnrollmentClaim = knownClaim
                         enrollmentUi = EnrollmentUi.GUIDE
-                        enrollmentHeading.text = "Register your face for ${knownClaim.employeeFirstName}"
-                        enrollmentSite.text = "Site: ${knownClaim.siteName}"
+                        enrollmentHeading.text = "Register your face for ${knownClaim.employeeFirstName} at ${knownClaim.siteName}"
                         enrollmentNotice.text = "Notice · version ${knownClaim.notice.version}\n\n${knownClaim.notice.text}"
                         selfConsent.text = "I have read and agree to this notice (version ${knownClaim.notice.version})."
                         selfConsent.isChecked = false
@@ -871,11 +1102,11 @@ internal class KioskActivity : ComponentActivity() {
                         acceptEnrollmentClaim(api.claimEnrollment(updated.claimRequestId, code))
                     } catch (_: Exception) {
                         ephemeralEnrollmentCode = null
-                        cancelClaimAndResolve(updated, "The claim could not be restored. Ask the employee to get a new code in Attendance.")
+                        cancelClaimAndResolve(updated, "The claim could not be restored. Ask the employee to tap Regenerate code in the Attendance app.")
                     }
                 } else {
                     // Status omits the approved notice, so a recovered claim without in-memory claim details is cancelled.
-                    cancelClaimAndResolve(updated, "The saved claim was recovered. Ask the employee to get a new code in Attendance.")
+                    cancelClaimAndResolve(updated, "The saved claim was recovered. Ask the employee to tap Regenerate code in the Attendance app.")
                 }
             }
             "issued", "expired", "cancelled", "superseded", "not_found" -> {
@@ -894,7 +1125,7 @@ internal class KioskActivity : ComponentActivity() {
                         enrollmentUi = if (startup) EnrollmentUi.IDLE else EnrollmentUi.ENTRY
                         selfCodeInput.setText("")
                         finishEnrollmentFlow(if (result.state == "cancelled" || result.state == "expired" || result.state == "superseded")
-                            "Enrollment did not complete. Get a new code in Attendance to start again."
+                            "Enrollment did not complete. Tap Regenerate code in the Attendance app to start again."
                         else fallbackMessage)
                     }
                 }
@@ -946,6 +1177,7 @@ internal class KioskActivity : ComponentActivity() {
     private fun cancelSelfServiceEnrollment() {
         selfCodeInput.setText("")
         activeCapture.set(null)
+        activeSweep.set(null)
         ephemeralEnrollmentCode = null
         val reference = enrollmentReference
         if (reference == null) {
@@ -953,10 +1185,10 @@ internal class KioskActivity : ComponentActivity() {
             cancellationRequested = false
             clearGuideIdentity()
             enrollmentUi = EnrollmentUi.IDLE
-            viewfinder.visibility = View.VISIBLE
+            cameraLayer.visibility = View.VISIBLE
             message("Enrollment cancelled. Select an action or set up biometric.")
         } else {
-            requestEnrollmentCancellation("Enrollment cancelled. Get a new code in Attendance to start again.")
+            requestEnrollmentCancellation("Enrollment cancelled. Tap Regenerate code in the Attendance app to start again.")
         }
     }
 
@@ -966,6 +1198,7 @@ internal class KioskActivity : ComponentActivity() {
             return
         }
         activeCapture.set(null)
+        activeSweep.set(null)
         ephemeralEnrollmentCode = null
         activeEnrollmentClaim = null
         recoveredEmployeeName = null
@@ -996,7 +1229,7 @@ internal class KioskActivity : ComponentActivity() {
                     cancellationRequested = false
                     onScreen {
                         enrollmentUi = EnrollmentUi.IDLE
-                        viewfinder.visibility = View.VISIBLE
+                        cameraLayer.visibility = View.VISIBLE
                         message(messageAfter)
                     }
                 }
@@ -1019,11 +1252,11 @@ internal class KioskActivity : ComponentActivity() {
             return
         }
         if (!selfConsent.isChecked) {
-            message("Read the notice and check the agreement box before starting the camera.")
+            message("Read the notice, then tap Agree and start camera.")
             return
         }
         if (!Instant.now().isBefore(claim.captureExpiresAt)) {
-            requestEnrollmentCancellation("The enrollment session expired. Get a new code in Attendance to start again.")
+            requestEnrollmentCancellation("The enrollment session expired. Tap Regenerate code in the Attendance app to start again.")
             return
         }
         if (!cameraReady) {
@@ -1033,21 +1266,27 @@ internal class KioskActivity : ComponentActivity() {
         }
         val currentFlow = startFlow("Look at the front camera. Keep one face centered.")
         enrollmentUi = EnrollmentUi.CAPTURING
-        enrollmentInstruction.text = "Look at the front camera and keep one face centered."
-        captureProgress.text = "0 of 3 live samples accepted."
+        acceptedSamples = 0
+        sweepFit = FaceGuideView.Fit.NONE
+        enrollmentInstruction.text = PoseSweep.prompts[0]
+        captureProgress.text = "Step 1 of ${PoseSweep.prompts.size + 1}"
         render()
-        startCapture(currentFlow, CapturePurpose.SelfServiceEnrollment(claim))
+        startSweep(PoseSweep(claim, currentFlow, roster))
     }
 
     private fun showEnrollmentSuccess(employeeName: String?, siteName: String?) {
+        network.execute { runCatching { roster = api.roster() } }
         activeCapture.set(null)
+        activeSweep.set(null)
         activeEnrollmentClaim = null
         ephemeralEnrollmentCode = null
         selfCodeInput.setText("")
         recoveredEmployeeName = employeeName
         recoveredSiteName = siteName
         clearGuideIdentity()
-        successText.text = listOfNotNull("Face registered", employeeName, siteName).joinToString(" · ")
+        val who = listOfNotNull(employeeName, siteName).joinToString(" · ")
+        successText.text = listOf(who, "Registration is confirmed.\nNo attendance record was created.")
+            .filter { it.isNotEmpty() }.joinToString("\n")
         enrollmentUi = EnrollmentUi.SUCCESS
         if (pending == null) {
             busy = false
@@ -1072,6 +1311,7 @@ internal class KioskActivity : ComponentActivity() {
 
     private fun finishSelfServiceEnrollment() {
         activeCapture.set(null)
+        activeSweep.set(null)
         selfCodeInput.setText("")
         selfConsent.isChecked = false
         clearGuideIdentity()
@@ -1080,13 +1320,12 @@ internal class KioskActivity : ComponentActivity() {
         recoveredEmployeeName = null
         recoveredSiteName = null
         enrollmentUi = EnrollmentUi.IDLE
-        viewfinder.visibility = View.VISIBLE
+        cameraLayer.visibility = View.VISIBLE
         message("Select an action or set up biometric.")
     }
 
     private fun clearGuideIdentity() {
         enrollmentHeading.text = ""
-        enrollmentSite.text = ""
         enrollmentNotice.text = ""
         selfConsent.text = ""
         selfConsent.isChecked = false
@@ -1104,14 +1343,12 @@ internal class KioskActivity : ComponentActivity() {
         }
         val capture = FaceCapture(purpose) { accepted ->
             if (purpose is CapturePurpose.SelfServiceEnrollment) onScreen {
-                val progress = "$accepted of 3 live samples accepted."
+                val progress = "Final live check: $accepted of 3"
+                acceptedSamples = PoseSweep.prompts.size + (if (accepted >= 3) 1 else 0)
                 captureProgress.text = progress
-                enrollmentInstruction.text = when (accepted) {
-                    1 -> "First sample accepted. Keep your face centered for the next sample."
-                    2 -> "Second sample accepted. Hold still for the final sample."
-                    else -> "All three samples accepted. Saving registration…"
-                }
+                enrollmentInstruction.text = if (accepted < 3) "Hold still" else "Saving…"
                 captureProgress.announceForAccessibility(progress)
+                render()
             }
         }
         activeCapture.set(capture)
@@ -1119,13 +1356,21 @@ internal class KioskActivity : ComponentActivity() {
         main.postDelayed({
             if (activeCapture.compareAndSet(capture, null)) {
                 if (purpose is CapturePurpose.SelfServiceEnrollment) {
-                    requestEnrollmentCancellation("Face capture timed out. Get a new code in Attendance to start again.")
+                    requestEnrollmentCancellation("Face capture timed out. Tap Regenerate code in the Attendance app to start again.")
                 } else finishFlow("Face capture timed out. Try again.")
             }
         }, 9000)
     }
 
     private fun analyze(image: androidx.camera.core.ImageProxy) {
+        activeSweep.get()?.let { sweep ->
+            try { stepSweep(sweep, image) } finally { image.close() }
+            return
+        }
+        if (activeCapture.get() == null) {
+            try { trackIdle(image) } finally { image.close() }
+            return
+        }
         val capture = activeCapture.get()
         try {
             if (capture == null) return
@@ -1138,7 +1383,7 @@ internal class KioskActivity : ComponentActivity() {
             if (capture != null && activeCapture.compareAndSet(capture, null)) onScreen {
                 if (capture.purpose is CapturePurpose.SelfServiceEnrollment) {
                     if (rejected.displayMessage.contains("timed out", ignoreCase = true)) {
-                        requestEnrollmentCancellation("Face capture timed out. Get a new code in Attendance to start again.")
+                        requestEnrollmentCancellation("Face capture timed out. Tap Regenerate code in the Attendance app to start again.")
                     } else {
                         enrollmentUi = EnrollmentUi.GUIDE
                         selfConsent.isChecked = false
@@ -1181,6 +1426,8 @@ internal class KioskActivity : ComponentActivity() {
                     val body = api.preparePunch(purpose.action, purpose.challenge, checkNotNull(result.template), result.frames)
                     val saved = PendingPunch(config.origin, config.deviceId, body, checkNotNull(result.template).displayName)
                     pendingStore.write(saved)
+                    // The face is verified and the signed punch is stored durably; tell the employee now, confirm below.
+                    onScreen { message("✓ ${capturedLabel(saved, purpose.action)} captured · confirming…") }
                     deliver(saved)
                 }
                 is CapturePurpose.Enrollment -> {
@@ -1201,6 +1448,12 @@ internal class KioskActivity : ComponentActivity() {
         enrollmentUi = EnrollmentUi.SAVING
         try {
             api.completeEnrollment(claim, consented = true, embedding = checkNotNull(result.embedding), frames = result.frames)
+        } catch (rejected: ApiRejected) {
+            if (rejected.code == "FACE_ALREADY_REGISTERED") {
+                // The server already cancelled this session; this face belongs to a registered employee.
+                onScreen { greetAlreadyRegistered(rejected.registeredName?.substringBefore(' ') ?: "there", cancelOnServer = false) }
+                return
+            }
         } catch (_: Exception) {
             // Resolve the durable server state below before allowing any new capture.
         }
@@ -1224,8 +1477,12 @@ internal class KioskActivity : ComponentActivity() {
 
     private fun retryPunch() {
         val saved = pending ?: return
-        if (busy || saved.origin != config.origin || saved.deviceId != config.deviceId) return
-        startFlow("Looking up your punch…")
+        if (saved.origin != config.origin || saved.deviceId != config.deviceId) return
+        if (busy) {
+            main.postDelayed({ retryPunch() }, 10_000)
+            return
+        }
+        startFlow("Syncing your punch…")
         submit { deliver(saved) }
     }
 
@@ -1236,14 +1493,20 @@ internal class KioskActivity : ComponentActivity() {
             pendingStore.clear()
             onScreen {
                 pending = null
-                finishFlow(rejectionMessage(rejected.code))
+                if (rejected.code == "ATTENDANCE_ACTION_ORDER") {
+                    val text = alreadyDone(saved, rejected.lastPunchAt)
+                    finishFlow(text)
+                    showBanner(text, Palette.orange)
+                } else finishFlow(rejectionMessage(rejected.code))
                 startCamera()
             }
             return
         } catch (_: Exception) {
             onScreen {
                 pending = saved
-                finishFlow("Punch confirmation is unavailable. Retry to read its receipt.")
+                finishFlow("✓ Punch captured on this kiosk${saved.displayName.takeIf { it.isNotBlank() }?.let { " for ${it.substringBefore(' ')}" }.orEmpty()}. Syncing automatically…")
+                // ponytail: one stored punch at a time, retried every 10 s; a multi-slot queue if offline spells get long.
+                main.postDelayed({ retryPunch() }, 10_000)
             }
             return
         }
@@ -1251,14 +1514,18 @@ internal class KioskActivity : ComponentActivity() {
         onScreen {
             pending = null
             startCamera()
-            val action = if (receipt.action == Action.IN) "Check-in" else "Check-out"
+            val action = if (receipt.action == Action.IN) "Punched in" else "Punched out"
             val time = java.time.format.DateTimeFormatter.ofPattern("d MMM, h:mm:ss a", java.util.Locale.ENGLISH)
                 .withZone(java.time.ZoneId.of("Asia/Kolkata")).format(receipt.recordedAt)
             val name = saved.displayName.takeIf { it.isNotBlank() }?.let { "$it · " }.orEmpty()
-            finishFlow("$name$action recorded at $time IST")
-            val receiptFlow = flow
-            main.postDelayed({ if (flow == receiptFlow && !busy) message("Select IN or OUT to begin.") }, 4000)
+            finishFlow("✓ $name$action at $time IST")
+            showBanner("✓ $name$action at $time IST", Palette.green)
         }
+    }
+
+    private fun capturedLabel(saved: PendingPunch, action: Action): String {
+        val name = saved.displayName.takeIf { it.isNotBlank() }?.let { "${it.substringBefore(' ')}'s " }.orEmpty()
+        return name + if (action == Action.IN) "check-in" else "check-out"
     }
 
     private fun canCapture() = usable && cameraReady && visible && !busy && pending == null
@@ -1283,6 +1550,7 @@ internal class KioskActivity : ComponentActivity() {
 
     private fun message(value: String) {
         status.text = value
+        pageStatus.text = value
         render()
     }
 
@@ -1291,22 +1559,22 @@ internal class KioskActivity : ComponentActivity() {
         val selfService = mode == Mode.KIOSK && !localTestMode
         val idle = enrollmentUi == EnrollmentUi.IDLE
         actions.visibility = if (mode == Mode.KIOSK && pending == null && idle) View.VISIBLE else View.GONE
-        enroll.text = if (mode == Mode.KIOSK) "Set up biometric" else "Capture enrollment"
         enroll.visibility = if (((mode == Mode.ENROLL) || (selfService && idle)) && pending == null) View.VISIBLE else View.GONE
         consent.visibility = if (mode == Mode.ENROLL) View.VISIBLE else View.GONE
         retry.visibility = if (pending != null) View.VISIBLE else View.GONE
         selfTest.visibility = if ((mode == Mode.KIOSK && idle) || localTestMode) View.VISIBLE else View.GONE
         returnToSetup.visibility = if (localTestMode && firstRunPanel != null) View.VISIBLE else View.GONE
         admin.visibility = if (LocalDeviceSetup.isConfigured(this) && idle) View.VISIBLE else View.GONE
-        enrollmentEntry.visibility = if (selfService && enrollmentUi in setOf(EnrollmentUi.ENTRY, EnrollmentUi.CLAIMING)) View.VISIBLE else View.GONE
+        entryScroll.visibility = if (selfService && enrollmentUi in setOf(EnrollmentUi.ENTRY, EnrollmentUi.CLAIMING)) View.VISIBLE else View.GONE
         val showGuide = selfService && enrollmentUi in setOf(EnrollmentUi.GUIDE, EnrollmentUi.CAPTURING, EnrollmentUi.SAVING)
+        enrollmentEntry.visibility = entryScroll.visibility
         enrollmentGuide.visibility = if (showGuide) View.VISIBLE else View.GONE
         enrollmentGuideScroll.visibility = if (showGuide) View.VISIBLE else View.GONE
         enrollmentRecovery.visibility = if (selfService && enrollmentUi == EnrollmentUi.RECOVERING) View.VISIBLE else View.GONE
         enrollmentSuccess.visibility = if (selfService && enrollmentUi == EnrollmentUi.SUCCESS && pending == null) View.VISIBLE else View.GONE
         cancelEnrollmentButton.isEnabled = enrollmentUi == EnrollmentUi.ENTRY || enrollmentUi == EnrollmentUi.CLAIMING
         continueEnrollment.isEnabled = !busy && !cancellationRequested && EnrollmentPolicy.validCode(selfCodeInput.text.toString())
-        startEnrollmentCapture.isEnabled = !busy && !cancellationRequested && cameraReady && selfConsent.isChecked && activeEnrollmentClaim != null
+        startEnrollmentCapture.isEnabled = !busy && !cancellationRequested && cameraReady && activeEnrollmentClaim != null
         selfConsent.isEnabled = enrollmentUi == EnrollmentUi.GUIDE && !busy && activeEnrollmentClaim != null
         retryEnrollmentStatus.isEnabled = !busy
         cancelRecoveredEnrollment.visibility = if (enrollmentReference?.sessionId != null) View.VISIBLE else View.GONE
@@ -1314,7 +1582,7 @@ internal class KioskActivity : ComponentActivity() {
         checkInAfterEnrollment.isEnabled = !busy && usable && cameraReady && pending == null
         finishEnrollment.isEnabled = !busy
         if (selfService) {
-            viewfinder.visibility = if (enrollmentUi == EnrollmentUi.IDLE || enrollmentUi == EnrollmentUi.CAPTURING) View.VISIBLE else View.GONE
+            cameraLayer.visibility = if (enrollmentUi == EnrollmentUi.IDLE || enrollmentUi == EnrollmentUi.CAPTURING) View.VISIBLE else View.GONE
         }
         val available = usable && cameraReady && !busy && pending == null && (idle || localTestMode)
         checkIn.isEnabled = available
@@ -1323,15 +1591,232 @@ internal class KioskActivity : ComponentActivity() {
         selfTest.isEnabled = available
         retry.isEnabled = usable && !busy && pending?.origin == (if (mode != null) config.origin else null)
             && pending?.deviceId == (if (mode != null) config.deviceId else null) && pending != null
+
+        val capturing = selfService && enrollmentUi == EnrollmentUi.CAPTURING
+        capturePanel.visibility = if (capturing) View.VISIBLE else View.GONE
+        cameraCaption.visibility = if (capturing) View.GONE else View.VISIBLE
+        captureHeading.text = enrollmentHeading.text
+        enrollmentInstruction.visibility = if (capturing) View.VISIBLE else View.GONE
+        faceGuide.steps = if (capturing) PoseSweep.prompts.size + 1 else 0
+        faceGuide.completed = acceptedSamples
+        if (!capturing) faceGuide.gesture = FaceGuideView.Gesture.NONE
+        trackingEnabled = cameraLayer.visibility == View.VISIBLE && cameraReady && idle && !busy && pending == null
+        if (!trackingEnabled) {
+            trackFit = FaceGuideView.Fit.NONE
+            greetName = null
+        }
+        val placed = if (capturing) sweepFit == FaceGuideView.Fit.OK else trackFit == FaceGuideView.Fit.OK
+        faceGuide.searching = !capturing && !placed
+        faceGuide.tint = when {
+            placed -> Palette.greenGuide
+            capturing -> Color.WHITE
+            else -> Palette.orange
+        }
+        cameraTitle.text = when {
+            greetName != null -> "Hello, ${greetName.orEmpty().substringBefore(' ')}"
+            trackingEnabled -> fitHint(trackFit)
+            else -> "Position your face in the frame"
+        }
+        if (shownGreeting != greetName) {
+            shownGreeting = greetName
+            checkIn.text = tileLabel("Check in", greetName)
+            checkOut.text = tileLabel("Check out", greetName)
+        }
+        cameraPill.text = when {
+            !cameraReady -> "Camera starting"
+            capturing || busy -> "Camera on"
+            else -> "Camera ready"
+        }
+        pillDot.setColor(if (cameraReady) Palette.greenDot else Palette.idleDot)
+        val pageShown = cameraLayer.visibility != View.VISIBLE
+        page.visibility = if (pageShown) View.VISIBLE else View.GONE
+        tools.visibility = if ((0 until tools.childCount).any { tools.getChildAt(it).visibility == View.VISIBLE }) View.VISIBLE else View.GONE
+        sheet.visibility = if ((0 until sheet.childCount).any { sheet.getChildAt(it).visibility == View.VISIBLE }) View.VISIBLE else View.GONE
+        val lightBars = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+        window.insetsController?.setSystemBarsAppearance(
+            if (pageShown) lightBars else WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS, lightBars)
+    }
+
+    // Assumes the employee follows the arrows; the sweep itself accepts either side first.
+    private val sweepGestures = listOf(FaceGuideView.Gesture.STRAIGHT, FaceGuideView.Gesture.LEFT,
+        FaceGuideView.Gesture.RIGHT, FaceGuideView.Gesture.UP, FaceGuideView.Gesture.DOWN)
+
+    private fun startSweep(sweep: PoseSweep) {
+        activeSweep.set(sweep)
+        main.postDelayed({
+            if (activeSweep.compareAndSet(sweep, null)) stopSweep("Registration timed out. Tap Agree and start camera to try again.")
+        }, 60_000)
+    }
+
+    private fun stopSweep(reason: String) {
+        enrollmentUi = EnrollmentUi.GUIDE
+        selfConsent.isChecked = false
+        sweepFit = FaceGuideView.Fit.NONE
+        finishFlow(reason)
+    }
+
+    /** Camera thread: advance the guided angle sweep, then hand over to the live three-frame check. */
+    private fun stepSweep(sweep: PoseSweep, image: androidx.camera.core.ImageProxy) {
+        val engine = engine ?: return
+        val tracked = try { engine.track(image, embed = true) } catch (_: Exception) { return }
+        val fit = faceGuide.fit(tracked, loose = sweep.step > 0)
+        try {
+            val placed = fit == FaceGuideView.Fit.OK ||
+                (sweep.tilting && fit != FaceGuideView.Fit.NONE && fit != FaceGuideView.Fit.MANY)
+            sweep.accept(tracked, placed)
+        } catch (rejected: CaptureRejected) {
+            if (activeSweep.compareAndSet(sweep, null)) onScreen { stopSweep(rejected.displayMessage) }
+            return
+        } catch (known: AlreadyRegistered) {
+            if (activeSweep.compareAndSet(sweep, null)) onScreen { greetAlreadyRegistered(known.firstName, cancelOnServer = true) }
+            return
+        }
+        val step = sweep.step
+        val finished = sweep.done && activeSweep.compareAndSet(sweep, null)
+        if (sweep.done && !finished) return
+        onScreen {
+            if (flow != sweep.flow || !visible || (!finished && activeSweep.get() !== sweep)) return@onScreen
+            sweepFit = fit
+            acceptedSamples = step
+            if (finished) {
+                enrollmentInstruction.text = "Look straight and hold still"
+                faceGuide.gesture = FaceGuideView.Gesture.STRAIGHT
+                captureProgress.text = "Final live check"
+                render()
+                startCapture(sweep.flow, CapturePurpose.SelfServiceEnrollment(sweep.claim, sweep.embeddings.toList()))
+            } else {
+                // During tilts keep showing the tilt prompt; "centre your face" would just undo the tilt.
+                val guiding = fit == FaceGuideView.Fit.OK || (sweep.tilting && fit != FaceGuideView.Fit.NONE && fit != FaceGuideView.Fit.MANY)
+                enrollmentInstruction.text = if (guiding) PoseSweep.prompts[step] else fitHint(fit)
+                faceGuide.gesture = if (guiding) sweepGestures[step] else FaceGuideView.Gesture.NONE
+                captureProgress.text = "Step ${step + 1} of ${PoseSweep.prompts.size + 1}"
+                render()
+            }
+        }
+    }
+
+    /** Camera thread, idle home screen: where the face sits and whose it is. Display only; a punch re-verifies. */
+    private fun trackIdle(image: androidx.camera.core.ImageProxy) {
+        if (!trackingEnabled) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastTrack < 300) return
+        lastTrack = now
+        val engine = engine ?: return
+        val known = roster
+        val tracked = try { engine.track(image, embed = known.isNotEmpty()) } catch (_: Exception) { return }
+        val fit = faceGuide.fit(tracked)
+        val name = tracked.embedding?.takeIf { fit == FaceGuideView.Fit.OK }?.let { embedding ->
+            // Same acceptance rule as a punch: a clear best match with a margin over the runner-up.
+            val ranked = known.map { it to similarity(embedding, it.feature) }.sortedByDescending { it.second }
+            val (candidate, best) = ranked.first()
+            val margin = best - (ranked.getOrNull(1)?.second ?: 0.0)
+            candidate.displayName.takeIf { best >= .50 && margin >= .10 && it.isNotBlank() }
+        }
+        onScreen {
+            if (!trackingEnabled || autoPunch(name)) return@onScreen
+            if (fit == trackFit && name == greetName) return@onScreen
+            trackFit = fit
+            greetName = name
+            render()
+        }
+    }
+
+    /**
+     * Starts the IN (before noon) or OUT (from 4 pm) punch once one recognised face has held still for a moment.
+     * The punch itself still runs the full live capture and server verification. Returns true when it started.
+     */
+    private fun autoPunch(name: String?): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (name == null || name != autoCandidate) {
+            autoCandidate = name
+            autoSeenAt = now
+            return false
+        }
+        // ponytail: 0.9 s hold and 60 s per-person cooldown are calibration knobs for the mounted kiosk.
+        if (now - autoSeenAt < 900 || (name == lastAutoName && now - lastAutoAt < 60_000)) return false
+        val action = PunchWindow.action() ?: return false
+        if (localTestMode || !::config.isInitialized || config.mode != Mode.KIOSK || enrollmentUi != EnrollmentUi.IDLE || !canCapture()) return false
+        lastAutoName = name
+        lastAutoAt = now
+        autoCandidate = null
+        begin(action)
+        return true
+    }
+
+    private fun fitHint(fit: FaceGuideView.Fit) = when (fit) {
+        FaceGuideView.Fit.NONE -> "Position your face in the oval"
+        FaceGuideView.Fit.MANY -> "Only one person at a time"
+        FaceGuideView.Fit.OFF_CENTER -> "Center your face in the oval"
+        FaceGuideView.Fit.TOO_FAR -> "Move a little closer"
+        FaceGuideView.Fit.TOO_CLOSE -> "Move back a little"
+        FaceGuideView.Fit.OK -> "Face in position"
+    }
+
+    private fun tileLabel(action: String, name: String?): CharSequence {
+        if (name == null) return action
+        return SpannableStringBuilder()
+            .append("Hello, ${name.substringBefore(' ')}\n", android.text.style.RelativeSizeSpan(.72f), 0)
+            .append("Tap to ${action.lowercase()}")
+    }
+
+    /**
+     * Main thread. A face that is already registered: leave enrollment, return to the camera and greet them in the banner.
+     * [cancelOnServer] releases the claimed code (early kiosk check); the server's own duplicate check already cancelled it.
+     */
+    private fun greetAlreadyRegistered(firstName: String, cancelOnServer: Boolean) {
+        val reference = enrollmentReference
+        enrollmentStore.clear()
+        enrollmentReference = null
+        ephemeralEnrollmentCode = null
+        activeEnrollmentClaim = null
+        activeCapture.set(null)
+        clearGuideIdentity()
+        enrollmentUi = EnrollmentUi.IDLE
+        cameraLayer.visibility = View.VISIBLE
+        startCamera()
+        val text = "Hey $firstName, you're already registered. Please punch in."
+        finishEnrollmentFlow(text)
+        showBanner(text, Palette.green)
+        // Best effort: if this fails the claim simply expires; the server's completion check still blocks a duplicate.
+        if (cancelOnServer && reference != null) network.execute { runCatching { api.cancelEnrollment(reference) } }
+    }
+
+    /** Solid banner over the camera for 6 seconds: green for a recorded punch, orange for a notice. */
+    private fun showBanner(text: String, color: Int) {
+        receiptBanner.text = text
+        receiptBanner.background = rounded(color, dp(16).toFloat())
+        receiptBanner.visibility = View.VISIBLE
+        val shownFlow = flow
+        main.postDelayed({
+            if (receiptBanner.text == text) receiptBanner.visibility = View.GONE
+            if (flow == shownFlow && !busy) message("Select IN or OUT to begin.")
+        }, 6000)
+    }
+
+    /** Plain wording for a punch the server refused as out of order, based on what was tried and the last punch. */
+    private fun alreadyDone(saved: PendingPunch, lastPunchAt: Instant?): String {
+        val name = saved.displayName.substringBefore(' ').ifBlank { "there" }
+        val tried = runCatching { org.json.JSONObject(saved.body).getString("action") }.getOrNull()
+        val time = lastPunchAt?.let {
+            java.time.format.DateTimeFormatter.ofPattern("h:mm a", java.util.Locale.ENGLISH)
+                .withZone(java.time.ZoneId.of("Asia/Kolkata")).format(it)
+        }
+        return when {
+            tried == "IN" && time != null -> "Hi $name, you already checked in at $time."
+            tried == "OUT" && time != null -> "Hi $name, you already checked out at $time."
+            tried == "OUT" -> "Hi $name, you haven't checked in yet. Check in first."
+            else -> "Hi $name, this punch is already recorded."
+        }
     }
 
     private fun rejectionMessage(code: String): String = when (code) {
-        "ATTENDANCE_ACTION_ORDER" -> "That action is out of order. Check your last recorded punch."
+        "ATTENDANCE_ACTION_ORDER" -> "This punch is already recorded."
         "KIOSK_RATE_LIMIT" -> "Too many attempts. Wait a moment and try again."
         "INVALID_KIOSK_CHALLENGE" -> "The camera check expired. Select an action to start again."
-        "KIOSK_ENROLLMENT_REJECTED" -> "Enrollment authorization expired or is invalid. Contact your supervisor."
+        "KIOSK_ENROLLMENT_REJECTED" -> "This code expired or is invalid. Tap Regenerate code in the Attendance app."
         "KIOSK_INTEGRITY_REJECTED", "INVALID_DEVICE_PROOF" -> "The kiosk could not be verified. Contact your supervisor."
         "BIOMETRIC_VERIFICATION_FAILED" -> "Face verification failed. Try again or contact your supervisor."
+        "FACE_ALREADY_REGISTERED" -> "This face is already registered. Contact your supervisor if this is wrong."
         else -> "Attendance could not confirm this request. Contact your supervisor."
     }
 
@@ -1342,7 +1827,7 @@ internal class KioskActivity : ComponentActivity() {
             } catch (failure: Exception) {
                 val value = when (failure) {
                     is CaptureRejected -> failure.displayMessage
-                    is ApiRejected -> rejectionMessage(failure.code)
+                    is ApiRejected -> failure.registeredName?.let { "Hey ${it.substringBefore(' ')}, you're already registered. Please punch in." } ?: rejectionMessage(failure.code)
                     else -> "The kiosk could not complete this request. Check the connection or contact your supervisor."
                 }
                 val saved = if (::pendingStore.isInitialized) runCatching { pendingStore.read() }.getOrNull() else null

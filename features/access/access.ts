@@ -154,6 +154,17 @@ export async function authorizeFaceRegistrationReset(
   if (result.rows.length !== 1) throw new AccessDeniedError();
 }
 
+/** Verify a linked HR/ADMIN actor with trusted AAL2 for HR work queues that have no single target employee. */
+export async function authorizeHrOperator(client: QueryClient, actor: Actor): Promise<void> {
+  const resolved = await resolveAuthenticatedSubject(client, actor);
+  if (resolved.employeeId !== actor.employeeId || actor.aal !== 'aal2') throw new AccessDeniedError();
+  const result = await client.query(
+    `SELECT 1 FROM access_operator_roles WHERE employee_id = $1 AND active AND role IN ('HR', 'ADMIN')`,
+    [actor.employeeId],
+  );
+  if (result.rows.length !== 1) throw new AccessDeniedError();
+}
+
 export interface ReadableEmployee {
   employeeId: string;
   displayName: string;
@@ -192,4 +203,87 @@ export async function listReadableEmployees(
     [actor.employeeId, limit, offset],
   );
   return result.rows.map(row => ({ employeeId: row.employee_id, displayName: row.display_name }));
+}
+
+export interface SignupRequest {
+  requestId: string;
+  email: string;
+  displayName: string;
+  createdAt: string;
+}
+
+/** Record a signed-in but unlinked account for HR approval. Idempotent; reports whether it is already linked. */
+export async function requestSignup(
+  client: QueryClient,
+  subject: VerifiedSubject & { email: string },
+  displayName: unknown,
+): Promise<{ state: 'pending' | 'approved'; operator: boolean }> {
+  if (!nonempty(subject.authProvider) || !nonempty(subject.authSubject) || !/^[^@\s]+@[^@\s]+$/.test(subject.email)) {
+    throw new AccessDeniedError();
+  }
+  const linked = await client.query<{ role: string | null }>(
+    `SELECT r.role FROM access_subject_links l JOIN access_employees e ON e.id = l.employee_id
+       LEFT JOIN access_operator_roles r ON r.employee_id = e.id AND r.active
+      WHERE l.auth_provider = $1 AND l.auth_subject = $2 AND l.active AND e.active`,
+    [subject.authProvider, subject.authSubject],
+  );
+  // `operator` only decides which tabs the app shows; every HR action re-checks role and MFA on the server.
+  if (linked.rows.length) return { state: 'approved', operator: linked.rows[0]!.role !== null };
+  const name = typeof displayName === 'string' ? displayName.trim() : '';
+  if (name.length < 1 || name.length > 120) throw new RangeError('Invalid display name');
+  await client.query(
+    `INSERT INTO access_signup_requests (auth_provider, auth_subject, email, display_name) VALUES ($1, $2, $3, $4)
+     ON CONFLICT (auth_provider, auth_subject) DO NOTHING`,
+    [subject.authProvider, subject.authSubject, subject.email, name],
+  );
+  return { state: 'pending', operator: false };
+}
+
+export async function listSignupRequests(client: QueryClient, actor: Actor): Promise<SignupRequest[]> {
+  await authorizeHrOperator(client, actor);
+  const result = await client.query<{ request_id: string; email: string; display_name: string; created_at: Date }>(
+    `SELECT request_id, email, display_name, created_at FROM access_signup_requests
+      WHERE employee_id IS NULL ORDER BY created_at LIMIT 200`,
+  );
+  return result.rows.map(row => ({ requestId: row.request_id, email: row.email, displayName: row.display_name,
+    createdAt: new Date(row.created_at).toISOString() }));
+}
+
+/**
+ * Turn a sign-up into an active employee (new ELT code) linked to the account and assigned to a site. Idempotent.
+ * ponytail: assigns the first active site by name; add a site picker when ELT runs more than one site.
+ */
+export async function approveSignup(
+  client: QueryClient,
+  actor: Actor,
+  requestId: string,
+): Promise<{ employeeId: string; employeeCode: string }> {
+  await authorizeHrOperator(client, actor);
+  return linkSignup(client, requestId);
+}
+
+/** Unauthenticated core of approveSignup. Only the offline operator CLI (provision.ts) may call it directly. */
+export async function linkSignup(client: QueryClient, requestId: string): Promise<{ employeeId: string; employeeCode: string }> {
+  const pending = await client.query<{ auth_provider: string; auth_subject: string; display_name: string; employee_id: string | null }>(
+    `SELECT auth_provider, auth_subject, display_name, employee_id FROM access_signup_requests WHERE request_id = $1 FOR UPDATE`,
+    [requestId],
+  );
+  const row = pending.rows[0];
+  if (!row) throw new AccessDeniedError();
+  if (row.employee_id) {
+    const code = await client.query<{ employee_code: string }>('SELECT employee_code FROM access_employees WHERE id = $1', [row.employee_id]);
+    return { employeeId: row.employee_id, employeeCode: code.rows[0]!.employee_code };
+  }
+  const site = await client.query<{ id: string }>('SELECT id FROM access_sites WHERE active ORDER BY name, id LIMIT 1');
+  if (!site.rows[0]) throw new RangeError('No active site');
+  const employeeId = crypto.randomUUID();
+  const created = await client.query<{ employee_code: string }>(
+    'INSERT INTO access_employees (id, display_name) VALUES ($1, $2) RETURNING employee_code',
+    [employeeId, row.display_name],
+  );
+  await client.query('INSERT INTO access_employee_sites (employee_id, site_id) VALUES ($1, $2)', [employeeId, site.rows[0].id]);
+  await client.query('INSERT INTO access_subject_links (auth_provider, auth_subject, employee_id) VALUES ($1, $2, $3)',
+    [row.auth_provider, row.auth_subject, employeeId]);
+  await client.query('UPDATE access_signup_requests SET employee_id = $2 WHERE request_id = $1', [requestId, employeeId]);
+  return { employeeId, employeeCode: created.rows[0]!.employee_code };
 }

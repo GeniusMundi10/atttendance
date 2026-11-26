@@ -1,8 +1,7 @@
 'use client'
 // PURPOSE: Let employees request attendance date corrections and authorized reviewers decide each date.
-import { createClient, type Session, type SupabaseClient } from '@supabase/supabase-js'
 import { useEffect, useState, type FormEvent } from 'react'
-import { SecondFactor } from '../SecondFactor'
+import { useAuth } from '../AppShell'
 
 type Day = {dayId:string,requestId:string,employeeId:string,date:string,proposedIn:string|null,proposedOut:string|null,
   reason:string,status:'PENDING'|'APPROVED'|'REJECTED',revision:number,overrideReason:string|null,decidedAt:string|null}
@@ -26,9 +25,7 @@ const errors:Record<string,string>={monthly_correction_limit:'Only three dates p
 function explain(error:unknown) {const code=error instanceof Error?error.message:'request_failed';return errors[code]||'The request could not be completed. Please retry.'}
 
 export default function CorrectionsPage() {
-  const [auth,setAuth]=useState<SupabaseClient>()
-  const [session,setSession]=useState<Session|null>(null)
-  const [email,setEmail]=useState('')
+  const {token,requireMfa}=useAuth()
   const [mine,setMine]=useState<Day[]>([])
   const [review,setReview]=useState<Day[]>([])
   const [reason,setReason]=useState('')
@@ -39,15 +36,6 @@ export default function CorrectionsPage() {
   const [needMfa,setNeedMfa]=useState(false)
   const [reload,setReload]=useState(0)
   useEffect(()=>{
-    const url=process.env.NEXT_PUBLIC_SUPABASE_URL,key=process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
-    if (!url || !key) {setMessage('Sign-in has not been configured. Contact HR.');return}
-    const client=createClient(url,key)
-    setAuth(client)
-    const {data}=client.auth.onAuthStateChange((_event,next)=>setSession(next))
-    return ()=>data.subscription.unsubscribe()
-  },[])
-  const token=session?.access_token
-  useEffect(()=>{
     setMine([]);setReview([]);setNeedMfa(false)
     if (!token) return
     let active=true
@@ -57,15 +45,6 @@ export default function CorrectionsPage() {
       }).catch(error=>{if (active) {setNeedMfa(error instanceof Error && error.message==='mfa_required');setMessage(explain(error))}})
     return ()=>{active=false}
   },[token,reload])
-  async function signIn(event:FormEvent) {
-    event.preventDefault()
-    if (!auth || busy) return
-    setBusy(true)
-    try {
-      const {error}=await auth.auth.signInWithOtp({email:email.trim(),options:{shouldCreateUser:false,emailRedirectTo:location.origin+'/corrections'}})
-      setMessage(error?'Sign-in link unavailable. Contact HR.':'Check your work email for the sign-in link.')
-    } catch {setMessage('Could not reach sign-in. Please retry.')} finally {setBusy(false)}
-  }
   async function submit(event:FormEvent) {
     event.preventDefault()
     if (!token || busy) return
@@ -86,9 +65,8 @@ export default function CorrectionsPage() {
     } catch(error) {setMessage(explain(error));setReload(value=>value+1)} finally {setBusy(false)}
   }
   const change=(index:number,field:keyof Draft,value:string)=>setDrafts(current=>current.map((item,i)=>i===index?{...item,[field]:value}:item))
-  if (!session) return <section><h1>Attendance corrections</h1><form onSubmit={signIn}><label>Work email<input type="email" required autoComplete="email" value={email} onChange={event=>setEmail(event.target.value)}/></label><button disabled={!auth||busy}>Email sign-in link</button></form><p role="status">{message}</p></section>
-  if (needMfa && auth) return <section><h1>Verify to review corrections</h1><SecondFactor auth={auth} onVerified={()=>setReload(value=>value+1)}/><button className="secondary" onClick={()=>void auth.auth.signOut()}>Sign out</button></section>
-  return <section><header><h1>Attendance corrections</h1><button className="secondary" onClick={()=>void auth?.auth.signOut()}>Sign out</button></header>
+  useEffect(()=>{if (needMfa) requireMfa()},[needMfa])
+  return <section><h1>Attendance corrections</h1>
     <p>Select up to three distinct IST dates per calendar month. Pending and approved dates use a slot; rejected dates release it.</p>
     <form className="wide-form" onSubmit={submit}><h2>Request a correction</h2>
       {drafts.map((day,index)=><div className="date-row" key={index}>

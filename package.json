@@ -12,12 +12,16 @@
     "start": "next start apps/web",
     "typecheck": "tsc --noEmit",
     "migrate": "node --experimental-strip-types scripts/migrate.ts",
-    "test:integration": "node --experimental-strip-types --test tests/kiosk.test.ts tests/corrections.test.ts",
+    "whatsapp": "node --experimental-strip-types platform/whatsapp.ts",
+    "mobile:sync": "cd apps/mobile && cap sync android",
+    "test:integration": "node --experimental-strip-types --test tests/kiosk.test.ts tests/corrections.test.ts tests/whatsapp.test.ts",
     "test:features": "node --experimental-strip-types scripts/test-features.ts",
     "test:portal": "node --test tests/portal.test.mjs",
     "check": "npm run typecheck && npm run test:features && npm run test:integration && npm run build && npm run test:portal"
   },
   "dependencies": {
+    "@capacitor/android": "^8.6.3",
+    "@capacitor/core": "^8.6.3",
     "@supabase/supabase-js": "^2.119.2",
     "jose": "^6.2.18",
     "next": "^16.4.6",
@@ -26,6 +30,7 @@
     "react-dom": "^19.3.1"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.6.3",
     "@types/node": "^22.20.6",
     "@types/pg": "^8.23.1",
     "@types/react": "^19.3.2",

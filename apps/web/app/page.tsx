@@ -1,3 +1,3 @@
-// PURPOSE: Render the authenticated employee and administrator receipt screen.
-import { ReceiptPortal } from './ReceiptPortal'
-export default function Page() { return <ReceiptPortal/> }
+// PURPOSE: Employee home screen.
+import { Home } from './Home'
+export default function Page() { return <Home/> }

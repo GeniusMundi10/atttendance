@@ -23,6 +23,18 @@ import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 internal data class Sample(val embedding: FloatArray, val liveness: Int)
+/** [face] is YuNet's 15 values (box, eyes, nose, mouth corners, score) in the upright frame; null unless exactly one face. */
+internal class Tracked(val face: FloatArray?, val width: Int, val height: Int, val faces: Int, val embedding: FloatArray?)
+
+/** Head turn: nose offset from the eye midpoint, in eye-distance units (≈0 when facing the camera). */
+internal fun yaw(face: FloatArray): Float =
+    (face[8] - (face[4] + face[6]) / 2) / kotlin.math.abs(face[6] - face[4]).coerceAtLeast(1f)
+
+/** Head tilt: where the nose sits between the eye line and the mouth line (≈0.5 when level). */
+internal fun pitch(face: FloatArray): Float {
+    val eyes = (face[5] + face[7]) / 2
+    return (face[9] - eyes) / ((face[11] + face[13]) / 2 - eyes).coerceAtLeast(1f)
+}
 internal class CaptureRejected(val displayMessage: String) : IllegalStateException("Camera capture rejected")
 
 internal fun normalized(vector: FloatArray): FloatArray {
@@ -57,11 +69,11 @@ internal class FaceEngine(context: Context) : AutoCloseable {
             }
         }
 
-    fun inspect(image: ImageProxy): Sample? {
+    /** Upright BGR copy of a camera frame; the caller releases it. */
+    private fun upright(image: ImageProxy): Mat {
         val bitmap = image.toBitmap()
         val rgba = Mat()
         val bgr = Mat()
-        val faces = Mat()
         try {
             Utils.bitmapToMat(bitmap, rgba)
             Imgproc.cvtColor(rgba, bgr, Imgproc.COLOR_RGBA2BGR)
@@ -72,6 +84,53 @@ internal class FaceEngine(context: Context) : AutoCloseable {
                 270 -> Core.rotate(bgr, bgr, Core.ROTATE_90_COUNTERCLOCKWISE)
                 else -> error("Unexpected camera rotation")
             }
+            return bgr
+        } catch (failure: Throwable) {
+            bgr.release()
+            throw failure
+        } finally {
+            rgba.release()
+            bitmap.recycle()
+        }
+    }
+
+    private fun embedding(bgr: Mat, faces: Mat): FloatArray {
+        val aligned = Mat()
+        val raw = Mat()
+        try {
+            recognizer.alignCrop(bgr, faces, aligned)
+            recognizer.feature(aligned, raw)
+            val vector = FloatArray(128)
+            require(raw.rows() == 1 && raw.cols() == vector.size)
+            raw.get(0, 0, vector)
+            return normalized(vector)
+        } finally {
+            aligned.release()
+            raw.release()
+        }
+    }
+
+    /** Face box, landmarks and optionally an embedding for on-screen guidance. No liveness: never use as evidence. */
+    fun track(image: ImageProxy, embed: Boolean): Tracked {
+        val bgr = upright(image)
+        val faces = Mat()
+        try {
+            detector.setInputSize(bgr.size())
+            detector.detect(bgr, faces)
+            if (faces.rows() != 1) return Tracked(null, bgr.cols(), bgr.rows(), faces.rows(), null)
+            val face = FloatArray(15).also { faces.get(0, 0, it) }
+            if (face.any { !it.isFinite() } || face[14] < .9f) return Tracked(null, bgr.cols(), bgr.rows(), 0, null)
+            return Tracked(face, bgr.cols(), bgr.rows(), 1, if (embed) embedding(bgr, faces) else null)
+        } finally {
+            faces.release()
+            bgr.release()
+        }
+    }
+
+    fun inspect(image: ImageProxy): Sample? {
+        val bgr = upright(image)
+        val faces = Mat()
+        try {
             detector.setInputSize(bgr.size())
             detector.detect(bgr, faces)
             if (faces.empty()) return null
@@ -87,24 +146,10 @@ internal class FaceEngine(context: Context) : AutoCloseable {
             if (min(first, second) < .90) {
                 throw CaptureRejected("Live face check failed. Try again in even light.")
             }
-            val aligned = Mat()
-            val raw = Mat()
-            try {
-                recognizer.alignCrop(bgr, faces, aligned)
-                recognizer.feature(aligned, raw)
-                val vector = FloatArray(128)
-                require(raw.rows() == 1 && raw.cols() == vector.size)
-                raw.get(0, 0, vector)
-                return Sample(normalized(vector), (min(first, second) * 10000).roundToInt())
-            } finally {
-                aligned.release()
-                raw.release()
-            }
+            return Sample(embedding(bgr, faces), (min(first, second) * 10000).roundToInt())
         } finally {
             faces.release()
             bgr.release()
-            rgba.release()
-            bitmap.recycle()
         }
     }
 

@@ -39,11 +39,14 @@ export class AttendanceConflictError extends Error {
 export class AttendanceActionOrderError extends Error {
   readonly code = 'ATTENDANCE_ACTION_ORDER';
   readonly expectedAction: PunchAction;
+  /** When the employee's last punch was recorded, so the kiosk can say "you already checked in at …". */
+  readonly lastRecordedAt: string | null;
 
-  constructor(expectedAction: PunchAction) {
+  constructor(expectedAction: PunchAction, lastRecordedAt: string | null = null) {
     super(`Next punch must be ${expectedAction}`);
     this.name = 'AttendanceActionOrderError';
     this.expectedAction = expectedAction;
+    this.lastRecordedAt = lastRecordedAt;
   }
 }
 
@@ -137,12 +140,13 @@ export async function recordPunch(client: AttendanceTransaction, input: RecordPu
   // Requests lock first; employees lock second. Distinct requests for one employee therefore serialize.
   await client.query("SELECT pg_advisory_xact_lock(hashtextextended('attendance:employee:' || $1, 0))", [input.employeeId]);
   const latest = await client.query(
-    'SELECT action FROM attendance_punches WHERE employee_id = $1 ORDER BY sequence DESC LIMIT 1',
+    `SELECT action, to_char(recorded_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS recorded_at
+       FROM attendance_punches WHERE employee_id = $1 ORDER BY sequence DESC LIMIT 1`,
     [input.employeeId],
   );
   const lastAction = latest.rows[0]?.action;
   const expectedAction: PunchAction = lastAction === 'IN' ? 'OUT' : 'IN';
-  if (input.action !== expectedAction) throw new AttendanceActionOrderError(expectedAction);
+  if (input.action !== expectedAction) throw new AttendanceActionOrderError(expectedAction, latest.rows[0] ? String(latest.rows[0].recorded_at) : null);
 
   const inserted = await client.query(
     `INSERT INTO attendance_punches

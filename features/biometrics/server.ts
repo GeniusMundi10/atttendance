@@ -8,6 +8,7 @@ import {
 } from "./protocol.ts";
 import type { Punch, RequestProof } from "./protocol.ts";
 import { verifyPlayIntegrity } from "./integrity.ts";
+import { findRegisteredFace } from "./self-service.ts";
 
 export { BiometricsError } from "./protocol.ts";
 
@@ -221,6 +222,8 @@ export async function enrollFace(tx: Db, input: unknown) {
   `, [employeeId, device.siteId]);
   if (!assignment.rows.length) throw new BiometricsError("KIOSK_ENROLLMENT_REJECTED", 403);
   await verifyPlayIntegrity(integrityToken, payload, Date.parse(request.issuedAt) - 5000);
+  const registeredName = await findRegisteredFace(tx, embedding, employeeId);
+  if (registeredName) throw new BiometricsError("FACE_ALREADY_REGISTERED", 409, { registeredName });
 
   const templateId = randomUUID();
   const sealed = encryptEmbedding(embedding, `${device.siteId}/${employeeId}/${templateId}`, key);
@@ -240,6 +243,7 @@ export async function enrollFace(tx: Db, input: unknown) {
 }
 
 export {
+  approveFaceEnrollment,
   cancelFaceEnrollment,
   claimFaceEnrollment,
   completeFaceEnrollment,
@@ -247,6 +251,8 @@ export {
   getFaceEnrollmentSessionStatus,
   getFaceEnrollmentStatus,
   issueFaceEnrollmentCode,
+  listFaceEnrollmentQueue,
+  requestFaceReregistration,
   resetFaceRegistration,
   siteScopedEnrollmentDigest,
 } from "./self-service.ts";

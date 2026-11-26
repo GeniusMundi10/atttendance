@@ -1,7 +1,7 @@
 // PURPOSE: Expose production kiosk commands and role-scoped, read-only portal receipts.
-import { AccessDeniedError, AccessMfaRequiredError, authorizeReceiptRead, listReadableEmployees, resolveAuthenticatedSubject } from '../features/access/access.ts'
+import { AccessDeniedError, AccessMfaRequiredError, approveSignup, authorizeReceiptRead, listReadableEmployees, listSignupRequests, requestSignup, resolveAuthenticatedSubject } from '../features/access/access.ts'
 import { AttendanceActionOrderError, AttendanceConflictError, listPunchReceipts } from '../features/attendance/attendance.ts'
-import { BiometricsError, cancelFaceEnrollment, claimFaceEnrollment, completeFaceEnrollment, enrollFace, fetchRoster, getFaceEnrollmentSessionStatus, getFaceEnrollmentStatus, issueChallenge, issueFaceEnrollmentCode, resetFaceRegistration } from '../features/biometrics/server.ts'
+import { BiometricsError, approveFaceEnrollment, cancelFaceEnrollment, claimFaceEnrollment, completeFaceEnrollment, enrollFace, fetchRoster, getFaceEnrollmentSessionStatus, getFaceEnrollmentStatus, issueChallenge, issueFaceEnrollmentCode, listFaceEnrollmentQueue, requestFaceReregistration, resetFaceRegistration } from '../features/biometrics/server.ts'
 import { CorrectionError, listEffectiveDays } from '../features/corrections/corrections.ts'
 import { correctionsApi } from '../features/corrections/http.ts'
 import { scheduleApi } from '../features/schedule/http.ts'
@@ -41,6 +41,48 @@ async function dispatch(request:Request, parts:string[]) {
     })
     return enrollmentResponse(result)
   }
+  if (request.method === 'POST' && parts.length === 3 && parts[0] === 'me' && parts[1] === 'face-enrollment' && parts[2] === 'reregistration') {
+    const subject = await portalIdentity(request)
+    const data = await body(request)
+    exactKeys(data,['requestId','reason'])
+    return transaction(async tx=>{
+      const actor = await resolveAuthenticatedSubject(tx,subject)
+      return json(await requestFaceReregistration(tx,{employeeId:actor.employeeId,requestId:uuid(data.requestId),reason:data.reason}))
+    })
+  }
+  if (request.method === 'POST' && parts.length === 1 && parts[0] === 'signup') {
+    const subject = await portalIdentity(request)
+    const data = await body(request)
+    exactKeys(data,['displayName'])
+    try { return json(await transaction(tx=>requestSignup(tx,subject,data.displayName))) }
+    catch (err) { if (err instanceof RangeError) throw new HttpError(400,'invalid_name'); throw err }
+  }
+  if (request.method === 'GET' && parts.length === 2 && parts[0] === 'hr' && parts[1] === 'signups') {
+    const subject = await portalIdentity(request)
+    return transaction(async tx=>json({signups:await listSignupRequests(tx,await resolveAuthenticatedSubject(tx,subject))}))
+  }
+  if (request.method === 'POST' && parts.length === 4 && parts[0] === 'hr' && parts[1] === 'signups' && parts[3] === 'approve') {
+    const requestId = uuid(parts[2])
+    const subject = await portalIdentity(request)
+    return transaction(async tx=>{
+      const actor = await resolveAuthenticatedSubject(tx,subject)
+      let created
+      try { created = await approveSignup(tx,actor,requestId) }
+      catch (err) { if (err instanceof RangeError) throw new HttpError(409,'no_active_site'); throw err }
+      // One approval: the account is linked and may register a face straight away.
+      await approveFaceEnrollment(tx,{employeeId:created.employeeId},actor)
+      return json(created)
+    })
+  }
+  if (request.method === 'GET' && parts.length === 3 && parts[0] === 'hr' && parts[1] === 'face-enrollment' && parts[2] === 'queue') {
+    const subject = await portalIdentity(request)
+    return transaction(async tx=>json(await listFaceEnrollmentQueue(tx,await resolveAuthenticatedSubject(tx,subject))))
+  }
+  if (request.method === 'POST' && parts.length === 5 && parts[0] === 'hr' && parts[1] === 'employees' && parts[3] === 'face-enrollment' && parts[4] === 'approve') {
+    const employeeId = uuid(parts[2])
+    const subject = await portalIdentity(request)
+    return transaction(async tx=>json(await approveFaceEnrollment(tx,{employeeId},await resolveAuthenticatedSubject(tx,subject))))
+  }
   if (request.method === 'POST' && parts.length === 5 && parts[0] === 'hr' && parts[1] === 'employees' && parts[3] === 'face-registration' && parts[4] === 'reset') {
     const employeeId = uuid(parts[2])
     const subject = await portalIdentity(request)
@@ -62,7 +104,12 @@ async function dispatch(request:Request, parts:string[]) {
         const result = await transaction(tx=>claimFaceEnrollment(tx,data,proof))
         return enrollmentResponse(result)
       }
-      case 'enrollment-complete': return json(await transaction(tx=>completeFaceEnrollment(tx,data)))
+      case 'enrollment-complete': {
+        const result = await transaction(tx=>completeFaceEnrollment(tx,data))
+        // The cancelled session is committed; the kiosk greets the already-registered person by first name.
+        if (result.state === 'duplicate') return json({error:'FACE_ALREADY_REGISTERED',registeredName:result.registeredName},409)
+        return json(result)
+      }
       case 'enrollment-status': return json(await transaction(tx=>getFaceEnrollmentSessionStatus(tx,data,proof)))
       case 'enrollment-cancel': return json(await transaction(tx=>cancelFaceEnrollment(tx,data,proof)))
       case 'punches': return json(await transaction(tx=>submitPunch(tx,data)))
@@ -87,10 +134,11 @@ async function dispatch(request:Request, parts:string[]) {
 export async function api(request:Request, parts:string[]) {
   try { return await dispatch(request,parts) }
   catch (err) {
-    if (err instanceof HttpError || err instanceof BiometricsError) return json({error:err.code},err.status)
+    if (err instanceof BiometricsError) return json({...err.detail,error:err.code},err.status)
+    if (err instanceof HttpError) return json({error:err.code},err.status)
     if (err instanceof AccessMfaRequiredError) return json({error:'mfa_required'},403)
     if (err instanceof AccessDeniedError) return json({error:'access_denied'},403)
-    if (err instanceof AttendanceActionOrderError) return json({error:err.code,expectedAction:err.expectedAction},409)
+    if (err instanceof AttendanceActionOrderError) return json({error:err.code,expectedAction:err.expectedAction,lastRecordedAt:err.lastRecordedAt},409)
     if (err instanceof AttendanceConflictError) return json({error:err.code},409)
     if (err instanceof CorrectionError) return json({error:err.code},err.status)
     if (err instanceof ScheduleError) return json({error:err.code},err.status)

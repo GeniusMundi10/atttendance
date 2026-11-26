@@ -13,7 +13,7 @@ async function serve(request:Request, action:'balance'|'requests'|'decision', id
     if (action==='requests' && request.method==='GET') return json({requests:await listLeaveRequests(client,actor)})
     if (action==='requests' && request.method==='POST') {
       const data=await body(request)
-      const result=await applyForPaidLeave(client,actor,{workDate:data.workDate,note:data.note})
+      const result=await applyForPaidLeave(client,actor,{workDate:data.workDate,note:data.note,leaveType:data.leaveType})
       return json(result,201)
     }
     if (action==='decision' && request.method==='POST' && id) {

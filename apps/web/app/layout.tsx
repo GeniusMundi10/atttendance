@@ -1,7 +1,9 @@
-// PURPOSE: Provide the layout shared by the employee and HR receipt views.
+// PURPOSE: Wrap every portal page in the shared sign-in gate and tab navigation.
 import type { ReactNode } from 'react'
+import { AppShell } from './AppShell'
 import './styles.css'
 export const metadata = {title:'Attendance · ELT Corporate'}
+export const viewport = {width:'device-width',initialScale:1,viewportFit:'cover',themeColor:'#ff6330'}
 export default function Layout({children}: {children:ReactNode}) {
-  return <html lang="en"><body><aside><img src="/elt.png" alt="ELT Corporate"/><strong>Attendance</strong><small>ELT Corporate</small><nav aria-label="Portal sections"><a href="/">Attendance</a><a href="/corrections">Corrections</a><a href="/leave">Paid leave</a></nav></aside><main>{children}</main></body></html>
+  return <html lang="en"><body><AppShell>{children}</AppShell></body></html>
 }

@@ -17,6 +17,8 @@ export type ScheduleDay = {
 export type Shift = {id:string,name:string,startTime:string,requiredMinutes:number,halfDayMinutes:number,weeklyOffDays:number[]}
 export type Holiday = {id:string,date:string,name:string,classification:'HOLIDAY'|'RESTRICTED'}
 export const MAX_RANGE_DAYS=366
+/** The seeded General Shift (9:30–6:00, Sunday off). Everyone without an explicit assignment follows it. */
+export const STANDARD_SHIFT_ID='6f1d0c1e-5a52-4f0e-9a39-0a1b8f3c2d01'
 export function isoDate(value:unknown):string {
   if (typeof value!=='string' || !/^20\d\d-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/.test(value)) throw new ScheduleError('invalid_date')
   const parsed=new Date(value+'T00:00:00.000Z')
@@ -37,17 +39,20 @@ export async function scheduleDays(client:QueryClient,employeeId:string,from:str
     date:string,site_id:string|null,shift_id:string|null,shift_name:string|null,start_time:string|null,
     required_minutes:number|null,half_day_minutes:number|null,weekly_off:boolean|null,
     holiday_name:string|null,classification:string|null
-  }>(`SELECT to_char(days.day,'YYYY-MM-DD') AS date, x.site_id, x.shift_id, s.name AS shift_name,
+  }>(`SELECT to_char(days.day,'YYYY-MM-DD') AS date, x.site_id, s.id AS shift_id, s.name AS shift_name,
         to_char(s.start_time,'HH24:MI') AS start_time, s.required_minutes, s.half_day_minutes,
         (EXTRACT(ISODOW FROM days.day)::smallint = ANY(s.weekly_off_days)) AS weekly_off,
         h.name AS holiday_name, h.classification
       FROM (SELECT d::date AS day FROM generate_series($2::date,$3::date,interval '1 day') d) days
       LEFT JOIN LATERAL (SELECT a.site_id,a.shift_id FROM schedule_assignments a
           WHERE a.employee_id=$1 AND a.effective_from<=days.day ORDER BY a.effective_from DESC LIMIT 1) x ON true
-      LEFT JOIN schedule_shifts s ON s.id=x.shift_id
-      LEFT JOIN schedule_holidays h ON h.site_id=x.site_id AND h.shift_id=x.shift_id
-        AND h.holiday_date=days.day AND h.removed_at IS NULL
-      ORDER BY days.day`,[employeeId,from,to])
+      LEFT JOIN schedule_shifts s ON s.id=COALESCE(x.shift_id,$4::uuid)
+      -- ponytail: with no assignment there is no site, so any site's calendar for the shift applies; fine for one office, assign sites once there are several.
+      LEFT JOIN LATERAL (SELECT hd.name,hd.classification FROM schedule_holidays hd
+          WHERE hd.shift_id=s.id AND hd.holiday_date=days.day AND hd.removed_at IS NULL
+            AND (hd.site_id=x.site_id OR x.site_id IS NULL)
+          ORDER BY hd.classification='HOLIDAY' DESC LIMIT 1) h ON true
+      ORDER BY days.day`,[employeeId,from,to,STANDARD_SHIFT_ID])
   return result.rows.map(row=>{
     const assigned=row.shift_id!==null
     const weeklyOff=assigned && row.weekly_off===true
@@ -62,7 +67,7 @@ export async function scheduleDays(client:QueryClient,employeeId:string,from:str
 export async function scheduleDay(client:QueryClient,employeeId:string,date:string):Promise<ScheduleDay> {
   return (await scheduleDays(client,employeeId,date,date))[0]!
 }
-/** True when leave may be applied against this date under the employee's assigned shift. */
+/** True when leave may be applied against this date under the employee's shift (assigned, or the standard one). */
 export async function isWorkingDay(client:QueryClient,employeeId:string,date:string):Promise<boolean> {
   return (await scheduleDay(client,employeeId,date)).kind==='WORKING'
 }

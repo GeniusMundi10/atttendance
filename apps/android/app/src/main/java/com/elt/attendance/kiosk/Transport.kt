@@ -23,7 +23,7 @@ import java.time.Instant
 import java.time.format.DateTimeFormatterBuilder
 import java.util.UUID
 import java.util.concurrent.TimeUnit
-import javax.net.ssl.HttpsURLConnection
+import java.net.HttpURLConnection
 
 internal val uuidPattern = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 internal val secretPattern = Regex("[A-Za-z0-9_-]{43}")
@@ -89,15 +89,20 @@ internal class DeviceSigner(deviceId: String, create: Boolean) {
 internal class PlayProof(context: Context, private val cloudProject: Long) {
     private val manager = IntegrityManagerFactory.createStandard(context.applicationContext)
     private var provider: StandardIntegrityManager.StandardIntegrityTokenProvider? = null
+    // ponytail: debug builds set up with project number 1 send a placeholder token for local server testing
+    // (KIOSK_INTEGRITY_DEV_BYPASS). Release builds are never debuggable, and production servers reject the placeholder.
+    private val localTest = cloudProject == 1L &&
+        (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
     fun prepare() {
-        if (provider != null) return
+        if (localTest || provider != null) return
         provider = Tasks.await(manager.prepareIntegrityToken(
             StandardIntegrityManager.PrepareIntegrityTokenRequest.builder().setCloudProjectNumber(cloudProject).build()
         ), 35, TimeUnit.SECONDS)
     }
 
     fun token(payload: String): String {
+        if (localTest) return "local-test-integrity-placeholder-" + "0".repeat(48)
         prepare()
         val hash = urlBase64(MessageDigest.getInstance("SHA-256").digest(payload.toByteArray(Charsets.UTF_8)))
         val request = StandardIntegrityManager.StandardIntegrityTokenRequest.builder().setRequestHash(hash).build()
@@ -131,7 +136,7 @@ internal data class EnrollmentStatus(
     val siteName: String?,
     val completedAt: Instant?,
 )
-internal class ApiRejected(val code: String, val waitSeconds: Int? = null) : IOException("Kiosk request rejected")
+internal class ApiRejected(val code: String, val waitSeconds: Int? = null, val registeredName: String? = null, val lastPunchAt: Instant? = null) : IOException("Kiosk request rejected")
 
 internal class KioskApi(private val config: KioskConfig, private val signer: DeviceSigner, private val play: PlayProof) {
     private var cachedRoster: List<Template> = emptyList()
@@ -282,7 +287,7 @@ internal class KioskApi(private val config: KioskConfig, private val signer: Dev
     private fun post(endpoint: String, body: JSONObject, proof: String? = null) = post(endpoint, body.toString(), proof)
 
     private fun post(endpoint: String, body: String, proof: String? = null): JSONObject {
-        val connection = URI(config.origin + "/api/kiosk/" + endpoint).toURL().openConnection() as HttpsURLConnection
+        val connection = URI(config.origin + "/api/kiosk/" + endpoint).toURL().openConnection() as HttpURLConnection
         try {
             connection.requestMethod = "POST"
             connection.connectTimeout = 7000
@@ -304,7 +309,9 @@ internal class KioskApi(private val config: KioskConfig, private val signer: Dev
                 // Only a definitive application-level rejection can retire an unresolved request.
                 if (code != null && code.matches(Regex("[A-Za-z][A-Za-z0-9_]{2,80}"))) {
                     val wait = errorObject?.optInt("waitSeconds")?.takeIf { it > 0 }
-                    throw ApiRejected(code, wait)
+                    val registered = errorObject?.optString("registeredName")?.takeIf { it.isNotBlank() }?.take(60)
+                    val lastPunchAt = errorObject?.optString("lastRecordedAt")?.let { runCatching { Instant.parse(it) }.getOrNull() }
+                    throw ApiRejected(code, wait, registered, lastPunchAt)
                 }
                 throw IOException("Kiosk server response was incomplete")
             }

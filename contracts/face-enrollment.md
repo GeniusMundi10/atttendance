@@ -110,6 +110,12 @@ Use the existing encrypted template store; template access through a kiosk roste
 
 Required server settings: `KIOSK_ENROLLMENT_CODE_KEY_HEX` (persistent 32-byte keyed-digest secret), `KIOSK_FACE_ENROLLMENT_NOTICE_VERSION`, and `KIOSK_FACE_ENROLLMENT_NOTICE_TEXT` (ELT-approved copy; if absent, self-service issuance/claim is unavailable). The existing `KIOSK_TEMPLATE_KEY_HEX`, Play Integrity configuration, and registered-device keys remain server-side. Never print configuration values.
 
+## Approval, duplicates, and re-registration requests
+
+`GET /api/me/face-enrollment` also returns `employeeCode`, `approvalPending` and `reregistrationRequested`. A new employee is pending until an HR/ADMIN actor with AAL2 calls `POST /api/hr/employees/:employeeId/face-enrollment/approve`; until then issuance fails with `FACE_ENROLLMENT_APPROVAL_PENDING`. Employees provisioned before the gate were approved by migration. `GET /api/hr/face-enrollment/queue` lists pending approvals and open re-registration requests for the same HR actors. `POST /api/me/face-enrollment/reregistration` `{requestId, reason}` records one open request per registered employee; an HR reset resolves it.
+
+Completion and supervised enrollment compare the new embedding with every other active employee's active template. A score at or above the kiosk's punch acceptance (0.50) commits the session as cancelled and returns 409 `{error:"FACE_ALREADY_REGISTERED", registeredName:"<first name>"}`; no template is written.
+
 ## Minimum verification cases
 
 Test six digits including leading zeroes; duplicate issuance taps and explicit reissue; collision retry; expiry; wrong site, wrong, used, expired, and superseded codes; durable issuance/claim throttles; two simultaneous kiosk claims; same-kiosk claim recovery; session-bound status/cancel; lost completion response; capture/cancel/expiry/reset races; revoked assignments/devices; existing-template backfill; existing-template first-write protection; cross-site transfer without registration reopening; HR-only AAL2 reset and audit; legacy operator-path lock enforcement; no enrollment punch/receipt/outbox side effects; and one separate successful check-in after registration. Use synthetic identities and disposable databases only.
