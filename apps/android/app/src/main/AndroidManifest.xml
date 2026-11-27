@@ -1,0 +1,24 @@
+<!-- PURPOSE: Run the managed kiosk with a physical front camera and HTTPS-only transport. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-feature android:name="android.hardware.camera.front" android:required="true" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/elt_logo"
+        android:label="ELT Attendance"
+        android:usesCleartextTraffic="false"
+        android:theme="@style/EltKiosk">
+        <meta-data android:name="android.content.APP_RESTRICTIONS" android:resource="@xml/kiosk_restrictions" />
+        <activity
+            android:name=".KioskActivity"
+            android:exported="true"
+            android:launchMode="singleTask" android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

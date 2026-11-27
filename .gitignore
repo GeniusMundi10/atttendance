@@ -1,0 +1,16 @@
+node_modules/
+.env
+.env.*
+!.env.example
+**/build/
+**/.gradle/
+local.properties
+.agent-worktrees/
+.manus/
+design-mockups/
+*.jks
+*.keystore
+dist/
+.next/
+.vercel/
+*.tsbuildinfo

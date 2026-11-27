@@ -1,0 +1,5 @@
+{
+  "name": "elt-attendance-mobile",
+  "private": true,
+  "description": "Capacitor shell for the ELT Attendance portal; dependencies resolve from the repository root."
+}
