@@ -1,0 +1,8 @@
+<!-- PURPOSE: Declare managed configuration for device binding and supervised setup. -->
+<restrictions xmlns:android="http://schemas.android.com/apk/res/android">
+    <restriction android:key="deviceId" android:restrictionType="string" android:title="Assigned device UUID" />
+    <restriction android:key="baseUrl" android:restrictionType="string" android:title="HTTPS server origin" />
+    <restriction android:key="cloudProject" android:restrictionType="string" android:title="Play Integrity Cloud project number" />
+    <restriction android:key="mode" android:restrictionType="string" android:title="Managed mode" android:defaultValue="kiosk" />
+    <restriction android:key="employeeId" android:restrictionType="string" android:title="Employee UUID for supervised enrollment" />
+</restrictions>

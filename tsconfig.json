@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["DOM", "DOM.Iterable", "ESNext"],
+    "jsx": "preserve",
+    "strict": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["node", "react"]
+  },
+  "include": ["platform/**/*.ts", "features/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts", "apps/web/**/*.ts", "apps/web/**/*.tsx"],
+  "exclude": ["node_modules", "apps/web/.next"]
+}

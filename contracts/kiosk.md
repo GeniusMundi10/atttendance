@@ -1,0 +1,10 @@
+# First online kiosk punch
+
+Use JSON, UTC ISO instants, UUIDs and explicit IN or OUT. Opaque secrets and server-only interfaces never enter the browser. Server modules are TypeScript with explicit .ts imports and erasable types. Use Node built-ins and PostgreSQL via pg. Feature SQL migrations and tests live in the feature folder.
+
+1. A registered Android kiosk requests a short-lived challenge from POST /api/kiosk/challenges with {deviceId,action}. Response {challengeId,nonce,expiresAt}. Rate limit issuance and bind to device and action.
+2. Android sends POST /api/kiosk/punches with {deviceId,action,requestId,challengeId,evidence}. requestId is the idempotency UUID. Biometrics owns evidence shape and verification. Its server module exports a production verifier that returns {employeeId,siteId,deviceId,challengeId} only on successful verified evidence. A committed identical retry returns its original receipt after validating its device origin. Never expose test verifiers via public runtime configuration.
+3. Access checks active employee and assigned kiosk site. Attendance atomically records a server-timed punch, receipt, audit and outbox row, enforces action ordering and uniqueness, and exposes get/list receipts. Receipt shape {punchId,employeeId,action,recordedAt}. Idempotency conflicts are rejected.
+4. A signed-in employee can read their own receipts. HR/admin can read an employee's receipts. A manager is scoped to assigned reports. GET /api/employees/:employeeId/punches returns {punches:[receipt,...]}. The portal renders exactly the same instants and actions.
+
+Feature owners publish concrete module signatures to the coordinator early. Shared transaction client injection keeps eligibility, challenge consumption and punch recording consistent. Keep tests in isolated databases with synthetic identities. The Android app must display success only after reading a committed receipt. Physical camera, liveness, integrity and latency require separate real-device verification before rollout.

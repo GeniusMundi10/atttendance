@@ -1,0 +1,47 @@
+<!doctype html>
+<!-- PURPOSE: Preview employee face registration, kiosk code entry and an explicit HR reset with fictional data. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Face registration · ELT Attendance</title>
+  <link rel="stylesheet" href="face-enrollment-preview.css">
+  <script defer src="face-enrollment-preview.js"></script>
+</head>
+<body>
+  <header class="top"><div class="wrap nav">
+    <div class="brand"><img src="../../apps/web/public/elt.png" alt="ELT"><b>Attendance</b></div>
+    <nav aria-label="Preview workspace"><button id="employee-tab" aria-pressed="true">Employee</button><button id="hr-tab" aria-pressed="false">HR preview</button></nav>
+  </div></header>
+  <main class="wrap">
+    <div class="heading"><div><p class="eyebrow">Employee services</p><h1 id="page-title">Face registration</h1></div>
+      <p id="intro">Get a code in your employee app.<br>Enter it at the kiosk to register your face.</p></div>
+    <div id="employee-view" class="workspace">
+      <section class="panel employee" aria-labelledby="employee-title">
+        <header class="bar"><span class="overline">Employee app</span><span class="avatar" aria-label="Asha Rao">AR</span></header>
+        <div class="body"><div class="identity"><h2 id="employee-title">Asha Rao</h2><p>Lake Road office</p></div>
+          <div id="account-card" class="ticket" aria-live="polite"></div>
+          <button id="issue" class="primary"></button>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="kiosk-title">
+        <header class="bar"><span class="overline">Android kiosk</span><span class="location">Front desk</span></header>
+        <div class="body" id="kiosk"></div>
+      </section>
+    </div>
+    <section id="hr-view" class="panel hr" hidden aria-labelledby="hr-title">
+      <header class="bar"><span class="overline">HR workspace</span><span class="location">Fictional account</span></header>
+      <div class="body"><h2 id="hr-title">Employee registration</h2><div class="staff"><div class="avatar">AR</div><div><strong>Asha Rao</strong><p>Lake Road office</p></div><span id="hr-status" class="badge"></span></div>
+      <p id="hr-note"></p><button id="reset" class="outline">Reset registration</button></div>
+    </section>
+    <dialog id="confirm-reset" aria-labelledby="reset-title"><form method="dialog">
+      <p class="eyebrow">HR preview</p><h2 id="reset-title">Reset Asha’s registration?</h2>
+      <p>Her current face registration will stop working. She can get a fresh code and register again.</p>
+      <div class="actions"><button class="outline" value="cancel" autofocus>Keep registration</button><button class="primary" value="reset">Confirm reset</button></div>
+    </form></dialog>
+    <p class="foot">Interactive preview · Fictional employee · Camera capture is simulated</p>
+    <p id="notice" role="status" class="sr"></p>
+    <noscript>Enable JavaScript to try the enrollment preview.</noscript>
+  </main>
+</body>
+</html>

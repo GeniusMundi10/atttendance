@@ -1,0 +1,10 @@
+# PURPOSE: Keep Android tooling, generated models, and build output out of Git.
+.gradle/
+.kotlin/
+**/build/
+local.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+keystore.properties
