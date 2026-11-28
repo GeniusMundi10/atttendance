@@ -94,6 +94,8 @@ internal class KioskActivity : ComponentActivity() {
     private lateinit var capturePanel: LinearLayout
     private lateinit var captureHeading: TextView
     private var acceptedSamples = 0
+    /** Live samples accepted in the running punch scan (of [PUNCH_SAMPLES]). */
+    private var punchSamples = 0
     private lateinit var status: TextView
     private lateinit var receiptBanner: TextView
     private lateinit var viewfinder: PreviewView
@@ -1394,7 +1396,13 @@ internal class KioskActivity : ComponentActivity() {
             } else finishFlow("Camera capture stopped. Select an action to try again.")
             return
         }
+        punchSamples = 0
         val capture = FaceCapture(purpose) { accepted ->
+            if (purpose is CapturePurpose.Punch) onScreen {
+                if (flow != currentFlow) return@onScreen
+                punchSamples = accepted
+                render()
+            }
             if (purpose is CapturePurpose.SelfServiceEnrollment) onScreen {
                 if (flow != currentFlow || !visible || enrollmentUi != EnrollmentUi.CAPTURING) return@onScreen
                 val progress = "Final live check: $accepted of 3"
@@ -1408,6 +1416,7 @@ internal class KioskActivity : ComponentActivity() {
         val active = ActiveCapture(capture, currentFlow, visit)
         activeCapture.set(active)
         message("Look at the front camera and keep your face centered.")
+        render()
         main.postDelayed({
             if (activeCapture.compareAndSet(active, null)) {
                 if (purpose is CapturePurpose.SelfServiceEnrollment) {
@@ -1695,8 +1704,9 @@ internal class KioskActivity : ComponentActivity() {
         cameraCaption.visibility = if (capturing) View.GONE else View.VISIBLE
         captureHeading.text = enrollmentHeading.text
         enrollmentInstruction.visibility = if (capturing) View.VISIBLE else View.GONE
-        faceGuide.steps = if (capturing) PoseSweep.prompts.size + 1 else 0
-        faceGuide.completed = acceptedSamples
+        val punchScan = activeCapture.get()?.capture?.purpose is CapturePurpose.Punch
+        faceGuide.steps = if (capturing) PoseSweep.prompts.size + 1 else if (punchScan) PUNCH_SAMPLES else 0
+        faceGuide.completed = if (punchScan) punchSamples else acceptedSamples
         if (!capturing) faceGuide.gesture = FaceGuideView.Gesture.NONE
         trackingEnabled = visible && cameraLayer.visibility == View.VISIBLE && cameraReady && idle && !busy && pending == null
         if (!trackingEnabled) {
@@ -1707,10 +1717,12 @@ internal class KioskActivity : ComponentActivity() {
         faceGuide.searching = !capturing && !placed
         faceGuide.tint = when {
             placed -> Palette.greenGuide
+            punchScan -> Palette.scanYellow
             capturing -> Color.WHITE
             else -> Palette.orange
         }
         cameraTitle.text = when {
+            punchScan -> "Hold still · ${punchSamples * 100 / PUNCH_SAMPLES}%"
             greetName != null -> "Hello, ${greetName.orEmpty().substringBefore(' ')}"
             trackingEnabled -> fitHint(trackFit)
             else -> "Position your face in the frame"
@@ -1836,7 +1848,7 @@ internal class KioskActivity : ComponentActivity() {
     }
 
     /**
-     * Starts the IN (before noon) or OUT (from 4 pm) punch once one recognised face has held still for a moment.
+     * Starts the IN punch (before noon) once one recognised face has held still for a moment. Check-out always needs a tap.
      * The punch itself still runs the full live capture and server verification. Returns true when it started.
      */
     private fun autoPunch(name: String?): Boolean {
