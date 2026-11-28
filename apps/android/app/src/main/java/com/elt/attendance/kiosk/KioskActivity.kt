@@ -18,9 +18,11 @@ import android.text.style.ImageSpan
 import android.content.res.ColorStateList
 import android.view.Gravity
 import android.hardware.camera2.CameraCharacteristics
+import android.media.AudioManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.InputType
 import android.text.InputFilter
 import android.view.View
@@ -57,8 +59,12 @@ import java.time.Instant
 internal class KioskActivity : ComponentActivity() {
     private val main = Handler(Looper.getMainLooper())
     private val inference = Executors.newSingleThreadExecutor()
-    private val activeCapture = AtomicReference<FaceCapture?>()
-    private val activeSweep = AtomicReference<PoseSweep?>()
+    private val activeCapture = AtomicReference<ActiveCapture?>()
+    private val activeSweep = AtomicReference<ActiveSweep?>()
+    private val voicePlayer = lazy { KioskVoicePlayer(this) }
+    private val voiceVisit = VoiceVisit()
+    private val voiceGuidance = VoiceGuidance()
+    private var enrollmentVoiceVisit: Int? = null
     @Volatile private var roster: List<Template> = emptyList()
     @Volatile private var trackingEnabled = false
     private var lastTrack = 0L
@@ -88,6 +94,8 @@ internal class KioskActivity : ComponentActivity() {
     private lateinit var capturePanel: LinearLayout
     private lateinit var captureHeading: TextView
     private var acceptedSamples = 0
+    /** Live samples accepted in the running punch scan (of [PUNCH_SAMPLES]). */
+    private var punchSamples = 0
     private lateinit var status: TextView
     private lateinit var receiptBanner: TextView
     private lateinit var viewfinder: PreviewView
@@ -136,12 +144,18 @@ internal class KioskActivity : ComponentActivity() {
     private var cancellationRequested = false
     private var enrollmentUi = EnrollmentUi.IDLE
     private var visible = false
+    private var voiceResumed = false
     private var usable = false
     private var cameraReady = false
     private var busy = false
     private var flow = 0
 
     private enum class EnrollmentUi { IDLE, ENTRY, CLAIMING, GUIDE, CAPTURING, SAVING, RECOVERING, SUCCESS }
+    private data class ActiveCapture(val capture: FaceCapture, val flow: Int, val voiceVisit: Int?) {
+        val purpose get() = capture.purpose
+    }
+    private data class ActiveSweep(val sweep: PoseSweep, val voiceVisit: Int)
+    private data class LivePunch(val action: Action, val voiceVisit: Int)
 
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
         if (allowed) attachCamera() else message("Allow camera access to verify attendance.")
@@ -149,6 +163,7 @@ internal class KioskActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        volumeControlStream = AudioManager.STREAM_MUSIC
         SetupPolicy.allowLoopbackHttp = (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or WindowManager.LayoutParams.FLAG_SECURE)
         drawScreen()
@@ -198,18 +213,29 @@ internal class KioskActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         visible = true
+        if (::config.isInitialized && config.mode == Mode.KIOSK && cameraReady) render()
     }
 
     override fun onResume() {
         super.onResume()
+        voiceVisit.invalidate()
+        voiceResumed = true
         if (::config.isInitialized && config.mode == Mode.KIOSK &&
             getSystemService(DevicePolicyManager::class.java).isLockTaskPermitted(packageName)) {
             startLockTask()
         }
     }
 
+    override fun onPause() {
+        voiceResumed = false
+        resetVoiceVisit()
+        super.onPause()
+    }
+
     override fun onStop() {
         visible = false
+        trackingEnabled = false
+        resetVoiceVisit()
         activeSweep.set(null)
         if (activeCapture.getAndSet(null) != null) finishFlow("Camera capture stopped.")
         if (::enrollmentStore.isInitialized && config.mode == Mode.KIOSK && enrollmentReference != null &&
@@ -224,7 +250,16 @@ internal class KioskActivity : ComponentActivity() {
         super.onStop()
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (!hasFocus) {
+            voiceGuidance.reset()
+            if (voicePlayer.isInitialized()) voicePlayer.value.stop()
+        }
+    }
+
     override fun onDestroy() {
+        if (voicePlayer.isInitialized()) voicePlayer.value.close()
         activeCapture.set(null)
         activeSweep.set(null)
         camera?.unbindAll()
@@ -897,12 +932,13 @@ internal class KioskActivity : ComponentActivity() {
     private fun begin(action: Action) {
         if (!canCapture()) return
         val currentFlow = startFlow("Connecting to attendance…")
+        val visit = voiceVisit.current()
         submit(currentFlow) {
             play.prepare()
             val roster = api.roster().also { this.roster = it }
             if (roster.isEmpty()) throw CaptureRejected("No active faces are enrolled for this site.")
             val challenge = api.challenge(action)
-            onScreen { startCapture(currentFlow, CapturePurpose.Punch(action, challenge, roster)) }
+            onScreen { startCapture(currentFlow, CapturePurpose.Punch(action, challenge, roster), visit) }
         }
     }
 
@@ -938,11 +974,13 @@ internal class KioskActivity : ComponentActivity() {
             retryEnrollmentRecovery()
             return
         }
+        resetVoiceVisit()
         activeEnrollmentClaim = null
         selfCodeInput.setText("")
         enrollmentUi = EnrollmentUi.ENTRY
         cameraLayer.visibility = View.GONE
         message("Enter the six-digit code from the employee’s Attendance app.")
+        speak(VoiceCue.REGISTER_START, voiceVisit.current())
         selfCodeInput.requestFocus()
     }
 
@@ -965,11 +1003,13 @@ internal class KioskActivity : ComponentActivity() {
         selfCodeInput.setText("")
         enrollmentUi = EnrollmentUi.CLAIMING
         val currentFlow = startFlow("Checking code…")
+        val visit = voiceVisit.current()
+        enrollmentVoiceVisit = visit
         network.execute {
             try {
                 play.prepare()
                 val claim = api.claimEnrollment(reference.claimRequestId, code)
-                acceptEnrollmentClaim(claim, currentFlow)
+                acceptEnrollmentClaim(claim, currentFlow, visit)
             } catch (failure: Exception) {
                 if (failure is ApiRejected && failure.code == "KIOSK_ENROLLMENT_REJECTED") {
                     if (cancellationRequested || flow != currentFlow) return@execute
@@ -982,15 +1022,16 @@ internal class KioskActivity : ComponentActivity() {
                         clearGuideIdentity()
                         enrollmentUi = EnrollmentUi.ENTRY
                         finishEnrollmentFlow("This code didn’t work. Check the six digits and your site, or tap Regenerate code in the Attendance app.")
+                        speak(VoiceCue.CODE_REJECTED, visit)
                     }
                 } else {
-                    resolveClaimFailure(reference, failure)
+                    resolveClaimFailure(reference, failure, visit)
                 }
             }
         }
     }
 
-    private fun acceptEnrollmentClaim(claim: EnrollmentClaim, currentFlow: Int? = null) {
+    private fun acceptEnrollmentClaim(claim: EnrollmentClaim, currentFlow: Int? = null, visit: Int? = null) {
         val reference = EnrollmentReference(claim.claimRequestId, claim.sessionId)
         enrollmentStore.write(reference)
         enrollmentReference = reference
@@ -1008,22 +1049,24 @@ internal class KioskActivity : ComponentActivity() {
                 enrollmentInstruction.text = "Read the notice before agreeing to start the camera."
                 captureProgress.text = "One live check uses three accepted samples."
                 finishEnrollmentFlow("Code accepted. Review the notice and confirm only if you agree.")
+                speak(VoiceCue.CONSENT, visit)
             }
         }
     }
 
-    private fun resolveClaimFailure(reference: EnrollmentReference, failure: Exception) {
+    private fun resolveClaimFailure(reference: EnrollmentReference, failure: Exception, visit: Int) {
         try {
             val recovered = api.enrollmentStatus(reference)
             val fallback = if (failure is ApiRejected && failure.code == "KIOSK_ENROLLMENT_RATE_LIMIT") {
                 "Too many code attempts. ${failure.waitSeconds?.let { "Wait $it seconds, then retry status." } ?: "Wait before trying again."}"
             } else "Checking registration…"
-            handleEnrollmentStatus(reference, recovered, startup = false, fallbackMessage = fallback)
+            handleEnrollmentStatus(reference, recovered, startup = false, fallbackMessage = fallback, visit = visit)
         } catch (_: Exception) {
             onScreen {
                 enrollmentUi = EnrollmentUi.RECOVERING
                 recoveryText.text = "Checking registration… The result is not confirmed yet. Do not enter another code or retry capture."
                 finishEnrollmentFlow("Checking registration…")
+                speak(VoiceCue.CHECKING, visit)
             }
         }
     }
@@ -1034,13 +1077,15 @@ internal class KioskActivity : ComponentActivity() {
     }
 
     private fun recoverEnrollmentStatus(reference: EnrollmentReference, startup: Boolean) {
+        val visit = enrollmentVoiceVisit.takeUnless { startup || cancellationRequested }
         enrollmentUi = EnrollmentUi.RECOVERING
         recoveryText.text = "Checking registration…"
         render()
+        speak(VoiceCue.CHECKING, visit)
         network.execute {
             try {
                 val status = api.enrollmentStatus(reference)
-                handleEnrollmentStatus(reference, status, startup, "Checking registration…")
+                handleEnrollmentStatus(reference, status, startup, "Checking registration…", visit)
             } catch (_: Exception) {
                 onScreen {
                     enrollmentUi = EnrollmentUi.RECOVERING
@@ -1056,6 +1101,7 @@ internal class KioskActivity : ComponentActivity() {
         result: EnrollmentStatus,
         startup: Boolean,
         fallbackMessage: String,
+        visit: Int? = null,
     ) {
         when (result.state) {
             "completed" -> {
@@ -1065,7 +1111,7 @@ internal class KioskActivity : ComponentActivity() {
                 cancellationRequested = false
                 val name = result.employeeFirstName ?: activeEnrollmentClaim?.employeeFirstName ?: recoveredEmployeeName
                 val site = result.siteName ?: activeEnrollmentClaim?.siteName ?: recoveredSiteName
-                onScreen { showEnrollmentSuccess(name, site) }
+                onScreen { showEnrollmentSuccess(name, site, visit) }
             }
             "claimed" -> {
                 val sessionId = result.sessionId ?: reference.sessionId
@@ -1093,13 +1139,14 @@ internal class KioskActivity : ComponentActivity() {
                         selfConsent.isChecked = false
                         enrollmentInstruction.text = "Read the notice before agreeing to start the camera."
                         finishEnrollmentFlow(fallbackMessage)
+                        speak(VoiceCue.CAPTURE_RETRY, visit)
                     }
                     return
                 }
                 val code = ephemeralEnrollmentCode
                 if (code != null) {
                     try {
-                        acceptEnrollmentClaim(api.claimEnrollment(updated.claimRequestId, code))
+                        acceptEnrollmentClaim(api.claimEnrollment(updated.claimRequestId, code), visit = visit)
                     } catch (_: Exception) {
                         ephemeralEnrollmentCode = null
                         cancelClaimAndResolve(updated, "The claim could not be restored. Ask the employee to tap Regenerate code in the Attendance app.")
@@ -1181,6 +1228,7 @@ internal class KioskActivity : ComponentActivity() {
         ephemeralEnrollmentCode = null
         val reference = enrollmentReference
         if (reference == null) {
+            resetVoiceVisit()
             activeEnrollmentClaim = null
             cancellationRequested = false
             clearGuideIdentity()
@@ -1193,6 +1241,7 @@ internal class KioskActivity : ComponentActivity() {
     }
 
     private fun requestEnrollmentCancellation(messageAfter: String) {
+        resetVoiceVisit()
         val reference = enrollmentReference ?: run {
             onScreen { activeEnrollmentClaim = null; enrollmentUi = EnrollmentUi.IDLE; message(messageAfter) }
             return
@@ -1265,16 +1314,20 @@ internal class KioskActivity : ComponentActivity() {
             return
         }
         val currentFlow = startFlow("Look at the front camera. Keep one face centered.")
+        val visit = voiceVisit.current()
+        enrollmentVoiceVisit = visit
         enrollmentUi = EnrollmentUi.CAPTURING
         acceptedSamples = 0
         sweepFit = FaceGuideView.Fit.NONE
         enrollmentInstruction.text = PoseSweep.prompts[0]
         captureProgress.text = "Step 1 of ${PoseSweep.prompts.size + 1}"
         render()
-        startSweep(PoseSweep(claim, currentFlow, roster))
+        playCameraVoice(voiceGuidance.startPose(SystemClock.elapsedRealtime()), visit)
+        startSweep(ActiveSweep(PoseSweep(claim, currentFlow, roster), visit))
     }
 
-    private fun showEnrollmentSuccess(employeeName: String?, siteName: String?) {
+    private fun showEnrollmentSuccess(employeeName: String?, siteName: String?, visit: Int?) {
+        val enteringSuccess = enrollmentUi != EnrollmentUi.SUCCESS
         network.execute { runCatching { roster = api.roster() } }
         activeCapture.set(null)
         activeSweep.set(null)
@@ -1291,6 +1344,7 @@ internal class KioskActivity : ComponentActivity() {
         if (pending == null) {
             busy = false
             message("Face registered. Registration was confirmed by the server.")
+            if (enteringSuccess) speak(VoiceCue.REGISTERED, visit)
         } else message("A punch is awaiting confirmation. Retry to read its receipt.")
     }
 
@@ -1310,6 +1364,7 @@ internal class KioskActivity : ComponentActivity() {
     }
 
     private fun finishSelfServiceEnrollment() {
+        resetVoiceVisit()
         activeCapture.set(null)
         activeSweep.set(null)
         selfCodeInput.setText("")
@@ -1333,7 +1388,7 @@ internal class KioskActivity : ComponentActivity() {
         captureProgress.text = ""
     }
 
-    private fun startCapture(currentFlow: Int, purpose: CapturePurpose) {
+    private fun startCapture(currentFlow: Int, purpose: CapturePurpose, visit: Int? = null) {
         if (flow != currentFlow) return
         if (!visible) {
             if (purpose is CapturePurpose.SelfServiceEnrollment) {
@@ -1341,8 +1396,15 @@ internal class KioskActivity : ComponentActivity() {
             } else finishFlow("Camera capture stopped. Select an action to try again.")
             return
         }
+        punchSamples = 0
         val capture = FaceCapture(purpose) { accepted ->
+            if (purpose is CapturePurpose.Punch) onScreen {
+                if (flow != currentFlow) return@onScreen
+                punchSamples = accepted
+                render()
+            }
             if (purpose is CapturePurpose.SelfServiceEnrollment) onScreen {
+                if (flow != currentFlow || !visible || enrollmentUi != EnrollmentUi.CAPTURING) return@onScreen
                 val progress = "Final live check: $accepted of 3"
                 acceptedSamples = PoseSweep.prompts.size + (if (accepted >= 3) 1 else 0)
                 captureProgress.text = progress
@@ -1351,10 +1413,12 @@ internal class KioskActivity : ComponentActivity() {
                 render()
             }
         }
-        activeCapture.set(capture)
+        val active = ActiveCapture(capture, currentFlow, visit)
+        activeCapture.set(active)
         message("Look at the front camera and keep your face centered.")
+        render()
         main.postDelayed({
-            if (activeCapture.compareAndSet(capture, null)) {
+            if (activeCapture.compareAndSet(active, null)) {
                 if (purpose is CapturePurpose.SelfServiceEnrollment) {
                     requestEnrollmentCancellation("Face capture timed out. Tap Regenerate code in the Attendance app to start again.")
                 } else finishFlow("Face capture timed out. Try again.")
@@ -1367,39 +1431,45 @@ internal class KioskActivity : ComponentActivity() {
             try { stepSweep(sweep, image) } finally { image.close() }
             return
         }
-        if (activeCapture.get() == null) {
+        val active = activeCapture.get()
+        if (active == null) {
             try { trackIdle(image) } finally { image.close() }
             return
         }
-        val capture = activeCapture.get()
         try {
-            if (capture == null) return
-            val result = capture.accept(image, checkNotNull(engine)) ?: return
-            if (activeCapture.compareAndSet(capture, null)) onScreen {
-                if (visible && busy) completeCapture(capture.purpose, result)
+            val result = active.capture.accept(image, checkNotNull(engine)) ?: return
+            if (activeCapture.compareAndSet(active, null)) onScreen {
+                if (flow != active.flow) return@onScreen
+                if (visible && busy) completeCapture(active.purpose, result, active.voiceVisit)
                 else finishFlow("Camera capture stopped. Select an action to try again.")
             }
         } catch (rejected: CaptureRejected) {
-            if (capture != null && activeCapture.compareAndSet(capture, null)) onScreen {
-                if (capture.purpose is CapturePurpose.SelfServiceEnrollment) {
+            if (activeCapture.compareAndSet(active, null)) onScreen {
+                if (flow != active.flow) return@onScreen
+                if (active.purpose is CapturePurpose.SelfServiceEnrollment) {
                     if (rejected.displayMessage.contains("timed out", ignoreCase = true)) {
                         requestEnrollmentCancellation("Face capture timed out. Tap Regenerate code in the Attendance app to start again.")
                     } else {
+                        stopCameraVoice()
                         enrollmentUi = EnrollmentUi.GUIDE
                         selfConsent.isChecked = false
                         enrollmentInstruction.text = rejected.displayMessage
                         captureProgress.text = "Capture stopped. Read the notice and agree again to retry."
                         finishFlow(rejected.displayMessage)
+                        speak(VoiceCue.CAPTURE_RETRY, active.voiceVisit)
                     }
                 } else finishFlow(rejected.displayMessage)
             }
         } catch (_: Exception) {
-            if (capture != null && activeCapture.compareAndSet(capture, null)) onScreen {
-                if (capture.purpose is CapturePurpose.SelfServiceEnrollment) {
+            if (activeCapture.compareAndSet(active, null)) onScreen {
+                if (flow != active.flow) return@onScreen
+                if (active.purpose is CapturePurpose.SelfServiceEnrollment) {
+                    stopCameraVoice()
                     enrollmentUi = EnrollmentUi.GUIDE
                     selfConsent.isChecked = false
                     enrollmentInstruction.text = "Camera verification failed. Read the notice and agree again to retry."
                     finishFlow("Camera verification failed. Read the notice and agree to try again.")
+                    speak(VoiceCue.CAPTURE_RETRY, active.voiceVisit)
                 } else finishFlow("Camera verification failed. Try again.")
             }
         } finally {
@@ -1407,11 +1477,12 @@ internal class KioskActivity : ComponentActivity() {
         }
     }
 
-    private fun completeCapture(purpose: CapturePurpose, result: CaptureResult) {
+    private fun completeCapture(purpose: CapturePurpose, result: CaptureResult, visit: Int?) {
         if (purpose is CapturePurpose.Diagnostic) {
             finishFlow("Live-face camera self-test passed. Nothing was recorded or sent.")
             return
         }
+        if (purpose is CapturePurpose.SelfServiceEnrollment) stopCameraVoice()
         if (purpose is CapturePurpose.SelfServiceEnrollment && !selfConsent.isChecked) {
             enrollmentUi = EnrollmentUi.GUIDE
             finishFlow("Agreement was withdrawn. Read the notice and agree before trying again.")
@@ -1428,7 +1499,7 @@ internal class KioskActivity : ComponentActivity() {
                     pendingStore.write(saved)
                     // The face is verified and the signed punch is stored durably; tell the employee now, confirm below.
                     onScreen { message("✓ ${capturedLabel(saved, purpose.action)} captured · confirming…") }
-                    deliver(saved)
+                    deliver(saved, visit?.let { LivePunch(purpose.action, it) })
                 }
                 is CapturePurpose.Enrollment -> {
                     api.enroll(purpose.employeeId, purpose.code, checkNotNull(result.embedding), result.frames)
@@ -1437,13 +1508,13 @@ internal class KioskActivity : ComponentActivity() {
                         finishFlow("Face enrollment saved.")
                     }
                 }
-                is CapturePurpose.SelfServiceEnrollment -> saveSelfServiceEnrollment(purpose.claim, result)
+                is CapturePurpose.SelfServiceEnrollment -> saveSelfServiceEnrollment(purpose.claim, result, visit)
                 is CapturePurpose.Diagnostic -> Unit
             }
         }
     }
 
-    private fun saveSelfServiceEnrollment(claim: EnrollmentClaim, result: CaptureResult) {
+    private fun saveSelfServiceEnrollment(claim: EnrollmentClaim, result: CaptureResult, visit: Int?) {
         val reference = enrollmentReference ?: return
         enrollmentUi = EnrollmentUi.SAVING
         try {
@@ -1451,7 +1522,9 @@ internal class KioskActivity : ComponentActivity() {
         } catch (rejected: ApiRejected) {
             if (rejected.code == "FACE_ALREADY_REGISTERED") {
                 // The server already cancelled this session; this face belongs to a registered employee.
-                onScreen { greetAlreadyRegistered(rejected.registeredName?.substringBefore(' ') ?: "there", cancelOnServer = false) }
+                onScreen {
+                    greetAlreadyRegistered(rejected.registeredName?.substringBefore(' ') ?: "there", cancelOnServer = false, visit = visit)
+                }
                 return
             }
         } catch (_: Exception) {
@@ -1461,11 +1534,12 @@ internal class KioskActivity : ComponentActivity() {
             enrollmentUi = EnrollmentUi.RECOVERING
             recoveryText.text = "Checking registration…"
             message("Checking registration…")
+            speak(VoiceCue.CHECKING, visit)
         }
         try {
             val status = api.enrollmentStatus(reference)
             handleEnrollmentStatus(reference, status, startup = false,
-                fallbackMessage = "Registration was not confirmed. Review the notice and agree before trying again.")
+                fallbackMessage = "Registration was not confirmed. Review the notice and agree before trying again.", visit = visit)
         } catch (_: Exception) {
             onScreen {
                 enrollmentUi = EnrollmentUi.RECOVERING
@@ -1486,7 +1560,7 @@ internal class KioskActivity : ComponentActivity() {
         submit { deliver(saved) }
     }
 
-    private fun deliver(saved: PendingPunch) {
+    private fun deliver(saved: PendingPunch, live: LivePunch? = null) {
         val receipt = try {
             api.submitPunch(saved)
         } catch (rejected: ApiRejected) {
@@ -1494,7 +1568,13 @@ internal class KioskActivity : ComponentActivity() {
             onScreen {
                 pending = null
                 if (rejected.code == "ATTENDANCE_ACTION_ORDER") {
-                    val text = alreadyDone(saved, rejected.lastPunchAt)
+                    val cue = PunchVoice.forOrderError(rejected, saved)
+                    val text = alreadyDone(saved, cue, rejected.lastPunchAt)
+                    finishFlow(text)
+                    showBanner(text, Palette.orange)
+                    speak(cue, live?.voiceVisit)
+                } else if (rejected.code == "ATTENDANCE_OUT_TOO_SOON") {
+                    val text = outTooSoon(saved, rejected)
                     finishFlow(text)
                     showBanner(text, Palette.orange)
                 } else finishFlow(rejectionMessage(rejected.code))
@@ -1520,6 +1600,7 @@ internal class KioskActivity : ComponentActivity() {
             val name = saved.displayName.takeIf { it.isNotBlank() }?.let { "$it · " }.orEmpty()
             finishFlow("✓ $name$action at $time IST")
             showBanner("✓ $name$action at $time IST", Palette.green)
+            if (live != null) speak(PunchVoice.forReceipt(live.action, receipt), live.voiceVisit)
         }
     }
 
@@ -1530,7 +1611,33 @@ internal class KioskActivity : ComponentActivity() {
 
     private fun canCapture() = usable && cameraReady && visible && !busy && pending == null
 
+    private fun canSpeak(visit: Int?) = visit != null && voiceVisit.isCurrent(visit) && voiceResumed && visible && hasWindowFocus() &&
+        ::config.isInitialized && config.mode == Mode.KIOSK && !localTestMode
+
+    private fun speak(cue: VoiceCue?, visit: Int?) {
+        if (cue != null && canSpeak(visit)) voicePlayer.value.play(cue)
+    }
+
+    private fun playCameraVoice(update: CameraVoiceUpdate, visit: Int) {
+        if (!canSpeak(visit)) return
+        if (update.cancel && voicePlayer.isInitialized()) voicePlayer.value.stopCamera()
+        update.cue?.let { voicePlayer.value.play(it, camera = true) }
+    }
+
+    private fun stopCameraVoice() {
+        voiceGuidance.reset()
+        if (voicePlayer.isInitialized()) voicePlayer.value.stopCamera()
+    }
+
+    private fun resetVoiceVisit() {
+        voiceVisit.invalidate()
+        enrollmentVoiceVisit = null
+        voiceGuidance.reset()
+        if (voicePlayer.isInitialized()) voicePlayer.value.stop()
+    }
+
     private fun startFlow(value: String): Int {
+        resetVoiceVisit()
         busy = true
         flow += 1
         message(value)
@@ -1597,10 +1704,11 @@ internal class KioskActivity : ComponentActivity() {
         cameraCaption.visibility = if (capturing) View.GONE else View.VISIBLE
         captureHeading.text = enrollmentHeading.text
         enrollmentInstruction.visibility = if (capturing) View.VISIBLE else View.GONE
-        faceGuide.steps = if (capturing) PoseSweep.prompts.size + 1 else 0
-        faceGuide.completed = acceptedSamples
+        val punchScan = activeCapture.get()?.capture?.purpose is CapturePurpose.Punch
+        faceGuide.steps = if (capturing) PoseSweep.prompts.size + 1 else if (punchScan) PUNCH_SAMPLES else 0
+        faceGuide.completed = if (punchScan) punchSamples else acceptedSamples
         if (!capturing) faceGuide.gesture = FaceGuideView.Gesture.NONE
-        trackingEnabled = cameraLayer.visibility == View.VISIBLE && cameraReady && idle && !busy && pending == null
+        trackingEnabled = visible && cameraLayer.visibility == View.VISIBLE && cameraReady && idle && !busy && pending == null
         if (!trackingEnabled) {
             trackFit = FaceGuideView.Fit.NONE
             greetName = null
@@ -1609,10 +1717,12 @@ internal class KioskActivity : ComponentActivity() {
         faceGuide.searching = !capturing && !placed
         faceGuide.tint = when {
             placed -> Palette.greenGuide
+            punchScan -> Palette.scanYellow
             capturing -> Color.WHITE
             else -> Palette.orange
         }
         cameraTitle.text = when {
+            punchScan -> "Hold still · ${punchSamples * 100 / PUNCH_SAMPLES}%"
             greetName != null -> "Hello, ${greetName.orEmpty().substringBefore(' ')}"
             trackingEnabled -> fitHint(trackFit)
             else -> "Position your face in the frame"
@@ -1641,22 +1751,27 @@ internal class KioskActivity : ComponentActivity() {
     private val sweepGestures = listOf(FaceGuideView.Gesture.STRAIGHT, FaceGuideView.Gesture.LEFT,
         FaceGuideView.Gesture.RIGHT, FaceGuideView.Gesture.UP, FaceGuideView.Gesture.DOWN)
 
-    private fun startSweep(sweep: PoseSweep) {
-        activeSweep.set(sweep)
+    private fun startSweep(active: ActiveSweep) {
+        activeSweep.set(active)
         main.postDelayed({
-            if (activeSweep.compareAndSet(sweep, null)) stopSweep("Registration timed out. Tap Agree and start camera to try again.")
+            if (activeSweep.compareAndSet(active, null)) {
+                stopSweep("Registration timed out. Tap Agree and start camera to try again.", active.voiceVisit)
+            }
         }, 60_000)
     }
 
-    private fun stopSweep(reason: String) {
+    private fun stopSweep(reason: String, visit: Int) {
+        stopCameraVoice()
         enrollmentUi = EnrollmentUi.GUIDE
         selfConsent.isChecked = false
         sweepFit = FaceGuideView.Fit.NONE
         finishFlow(reason)
+        speak(VoiceCue.CAPTURE_RETRY, visit)
     }
 
     /** Camera thread: advance the guided angle sweep, then hand over to the live three-frame check. */
-    private fun stepSweep(sweep: PoseSweep, image: androidx.camera.core.ImageProxy) {
+    private fun stepSweep(active: ActiveSweep, image: androidx.camera.core.ImageProxy) {
+        val sweep = active.sweep
         val engine = engine ?: return
         val tracked = try { engine.track(image, embed = true) } catch (_: Exception) { return }
         val fit = faceGuide.fit(tracked, loose = sweep.step > 0)
@@ -1665,17 +1780,23 @@ internal class KioskActivity : ComponentActivity() {
                 (sweep.tilting && fit != FaceGuideView.Fit.NONE && fit != FaceGuideView.Fit.MANY)
             sweep.accept(tracked, placed)
         } catch (rejected: CaptureRejected) {
-            if (activeSweep.compareAndSet(sweep, null)) onScreen { stopSweep(rejected.displayMessage) }
+            if (activeSweep.compareAndSet(active, null)) onScreen {
+                if (flow == sweep.flow) stopSweep(rejected.displayMessage, active.voiceVisit)
+            }
             return
         } catch (known: AlreadyRegistered) {
-            if (activeSweep.compareAndSet(sweep, null)) onScreen { greetAlreadyRegistered(known.firstName, cancelOnServer = true) }
+            if (activeSweep.compareAndSet(active, null)) onScreen {
+                if (flow == sweep.flow) greetAlreadyRegistered(known.firstName, cancelOnServer = true, visit = active.voiceVisit)
+            }
             return
         }
         val step = sweep.step
-        val finished = sweep.done && activeSweep.compareAndSet(sweep, null)
+        val tilting = sweep.tilting
+        val finished = sweep.done && activeSweep.compareAndSet(active, null)
         if (sweep.done && !finished) return
+        val now = SystemClock.elapsedRealtime()
         onScreen {
-            if (flow != sweep.flow || !visible || (!finished && activeSweep.get() !== sweep)) return@onScreen
+            if (flow != sweep.flow || !visible || (!finished && activeSweep.get() !== active)) return@onScreen
             sweepFit = fit
             acceptedSamples = step
             if (finished) {
@@ -1683,13 +1804,16 @@ internal class KioskActivity : ComponentActivity() {
                 faceGuide.gesture = FaceGuideView.Gesture.STRAIGHT
                 captureProgress.text = "Final live check"
                 render()
-                startCapture(sweep.flow, CapturePurpose.SelfServiceEnrollment(sweep.claim, sweep.embeddings.toList()))
+                stopCameraVoice()
+                playCameraVoice(CameraVoiceUpdate(VoiceCue.HOLD), active.voiceVisit)
+                startCapture(sweep.flow, CapturePurpose.SelfServiceEnrollment(sweep.claim, sweep.embeddings.toList()), active.voiceVisit)
             } else {
                 // During tilts keep showing the tilt prompt; "centre your face" would just undo the tilt.
-                val guiding = fit == FaceGuideView.Fit.OK || (sweep.tilting && fit != FaceGuideView.Fit.NONE && fit != FaceGuideView.Fit.MANY)
+                val guiding = fit == FaceGuideView.Fit.OK || (tilting && fit != FaceGuideView.Fit.NONE && fit != FaceGuideView.Fit.MANY)
                 enrollmentInstruction.text = if (guiding) PoseSweep.prompts[step] else fitHint(fit)
                 faceGuide.gesture = if (guiding) sweepGestures[step] else FaceGuideView.Gesture.NONE
                 captureProgress.text = "Step ${step + 1} of ${PoseSweep.prompts.size + 1}"
+                if (canSpeak(active.voiceVisit)) playCameraVoice(voiceGuidance.pose(step, fit, now), active.voiceVisit)
                 render()
             }
         }
@@ -1697,8 +1821,9 @@ internal class KioskActivity : ComponentActivity() {
 
     /** Camera thread, idle home screen: where the face sits and whose it is. Display only; a punch re-verifies. */
     private fun trackIdle(image: androidx.camera.core.ImageProxy) {
+        val visit = voiceVisit.current()
         if (!trackingEnabled) return
-        val now = android.os.SystemClock.elapsedRealtime()
+        val now = SystemClock.elapsedRealtime()
         if (now - lastTrack < 300) return
         lastTrack = now
         val engine = engine ?: return
@@ -1713,7 +1838,8 @@ internal class KioskActivity : ComponentActivity() {
             candidate.displayName.takeIf { best >= .50 && margin >= .10 && it.isNotBlank() }
         }
         onScreen {
-            if (!trackingEnabled || autoPunch(name)) return@onScreen
+            if (!trackingEnabled || !voiceVisit.isCurrent(visit) || autoPunch(name)) return@onScreen
+            if (canSpeak(visit)) playCameraVoice(voiceGuidance.daily(fit, now), visit)
             if (fit == trackFit && name == greetName) return@onScreen
             trackFit = fit
             greetName = name
@@ -1722,11 +1848,11 @@ internal class KioskActivity : ComponentActivity() {
     }
 
     /**
-     * Starts the IN (before noon) or OUT (from 4 pm) punch once one recognised face has held still for a moment.
+     * Starts the IN punch (before noon) once one recognised face has held still for a moment. Check-out always needs a tap.
      * The punch itself still runs the full live capture and server verification. Returns true when it started.
      */
     private fun autoPunch(name: String?): Boolean {
-        val now = android.os.SystemClock.elapsedRealtime()
+        val now = SystemClock.elapsedRealtime()
         if (name == null || name != autoCandidate) {
             autoCandidate = name
             autoSeenAt = now
@@ -1763,7 +1889,8 @@ internal class KioskActivity : ComponentActivity() {
      * Main thread. A face that is already registered: leave enrollment, return to the camera and greet them in the banner.
      * [cancelOnServer] releases the claimed code (early kiosk check); the server's own duplicate check already cancelled it.
      */
-    private fun greetAlreadyRegistered(firstName: String, cancelOnServer: Boolean) {
+    private fun greetAlreadyRegistered(firstName: String, cancelOnServer: Boolean, visit: Int?) {
+        stopCameraVoice()
         val reference = enrollmentReference
         enrollmentStore.clear()
         enrollmentReference = null
@@ -1777,6 +1904,7 @@ internal class KioskActivity : ComponentActivity() {
         val text = "Hey $firstName, you're already registered. Please punch in."
         finishEnrollmentFlow(text)
         showBanner(text, Palette.green)
+        speak(VoiceCue.ALREADY_REGISTERED, visit)
         // Best effort: if this fails the claim simply expires; the server's completion check still blocks a duplicate.
         if (cancelOnServer && reference != null) network.execute { runCatching { api.cancelEnrollment(reference) } }
     }
@@ -1793,24 +1921,36 @@ internal class KioskActivity : ComponentActivity() {
         }, 6000)
     }
 
-    /** Plain wording for a punch the server refused as out of order, based on what was tried and the last punch. */
-    private fun alreadyDone(saved: PendingPunch, lastPunchAt: Instant?): String {
+    /** The server refuses a check-out within 2 minutes of check-in (false check-out guard); say when it will be allowed. */
+    private fun outTooSoon(saved: PendingPunch, rejected: ApiRejected): String {
         val name = saved.displayName.substringBefore(' ').ifBlank { "there" }
-        val tried = runCatching { org.json.JSONObject(saved.body).getString("action") }.getOrNull()
+        val format = java.time.format.DateTimeFormatter.ofPattern("h:mm a", java.util.Locale.ENGLISH).withZone(java.time.ZoneId.of("Asia/Kolkata"))
+        val checkedIn = rejected.lastPunchAt
+        val allowed = checkedIn?.plusSeconds(120) ?: rejected.waitSeconds?.let { Instant.now().plusSeconds(it.toLong()) }
+        return when {
+            checkedIn != null && allowed != null -> "Hi $name, you just checked in at ${format.format(checkedIn)}. You can check out after ${format.format(allowed)}."
+            else -> "Hi $name, you just checked in. Wait 2 minutes before checking out."
+        }
+    }
+
+    /** Plain wording for a punch the server refused as out of order, based on what was tried and the last punch. */
+    private fun alreadyDone(saved: PendingPunch, cue: VoiceCue?, lastPunchAt: Instant?): String {
+        val name = saved.displayName.substringBefore(' ').ifBlank { "there" }
         val time = lastPunchAt?.let {
             java.time.format.DateTimeFormatter.ofPattern("h:mm a", java.util.Locale.ENGLISH)
                 .withZone(java.time.ZoneId.of("Asia/Kolkata")).format(it)
         }
-        return when {
-            tried == "IN" && time != null -> "Hi $name, you already checked in at $time."
-            tried == "OUT" && time != null -> "Hi $name, you already checked out at $time."
-            tried == "OUT" -> "Hi $name, you haven't checked in yet. Check in first."
-            else -> "Hi $name, this punch is already recorded."
+        return when (cue) {
+            VoiceCue.ALREADY_IN -> "Hi $name, you already checked in at $time."
+            VoiceCue.ALREADY_OUT -> "Hi $name, you already checked out at $time."
+            VoiceCue.CHECK_IN_FIRST -> "Hi $name, you haven't checked in yet. Check in first."
+            else -> rejectionMessage("ATTENDANCE_ACTION_ORDER")
         }
     }
 
     private fun rejectionMessage(code: String): String = when (code) {
-        "ATTENDANCE_ACTION_ORDER" -> "This punch is already recorded."
+        "ATTENDANCE_ACTION_ORDER" -> "This punch was declined. Check your attendance history."
+        "ATTENDANCE_OUT_TOO_SOON" -> "You just checked in. Wait 2 minutes before checking out."
         "KIOSK_RATE_LIMIT" -> "Too many attempts. Wait a moment and try again."
         "INVALID_KIOSK_CHALLENGE" -> "The camera check expired. Select an action to start again."
         "KIOSK_ENROLLMENT_REJECTED" -> "This code expired or is invalid. Tap Regenerate code in the Attendance app."

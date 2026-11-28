@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=22.13"
+    "node": "22.x"
   },
   "scripts": {
     "dev": "next dev apps/web",
@@ -12,9 +12,9 @@
     "start": "next start apps/web",
     "typecheck": "tsc --noEmit",
     "migrate": "node --experimental-strip-types scripts/migrate.ts",
-    "whatsapp": "node --experimental-strip-types platform/whatsapp.ts",
+    "whatsapp": "node --experimental-strip-types platform/whatsapp-cli.ts",
     "mobile:sync": "cd apps/mobile && cap sync android",
-    "test:integration": "node --experimental-strip-types --test tests/kiosk.test.ts tests/corrections.test.ts tests/whatsapp.test.ts",
+    "test:integration": "node --experimental-strip-types --test platform/db.test.ts tests/kiosk.test.ts tests/corrections.test.ts tests/whatsapp.test.ts",
     "test:features": "node --experimental-strip-types scripts/test-features.ts",
     "test:portal": "node --test tests/portal.test.mjs",
     "check": "npm run typecheck && npm run test:features && npm run test:integration && npm run build && npm run test:portal"

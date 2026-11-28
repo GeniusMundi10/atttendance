@@ -19,7 +19,7 @@ test('2026 calendar, effective-dated shifts, scope, audit and leave use one sche
   try {
     await db.query(`CREATE SCHEMA "${schema}"`)
     await db.query(`SET search_path TO "${schema}"`)
-    for (const f of ['../access/migrations/001_access.sql','../leave/migrations/001_paid_leave.sql','./migrations/001_schedule.sql']) await db.query(await read(f))
+    for (const f of ['../access/migrations/001_access.sql','../leave/migrations/001_paid_leave.sql','../leave/migrations/002_leave_type.sql','./migrations/001_schedule.sql']) await db.query(await read(f))
     const calendar=JSON.parse(await read('./data/holidays-2026.json')) as {location:string,shift:string,holidays:{date:string,name:string,classification:string}[]}
     const site=randomUUID(), otherSite=randomUUID()
     await db.query('INSERT INTO access_sites(id,name) VALUES ($1,$2),($3,$4)',[site,calendar.location,otherSite,'Other site'])
@@ -83,7 +83,9 @@ test('2026 calendar, effective-dated shifts, scope, audit and leave use one sche
     await assert.rejects(readSchedule(db,strangerActor,{employeeId:employee,from:'2026-11-01',to:'2026-11-30'}),AccessDeniedError)
     await assert.rejects(readSchedule(db,employeeActor,{employeeId:employee,from:'2026-11-30',to:'2026-11-01'}),(e:unknown)=>e instanceof ScheduleError && e.code==='invalid_range')
     await assert.rejects(readSchedule(db,employeeActor,{employeeId:employee,from:'2026-02-30',to:'2026-03-01'}),(e:unknown)=>e instanceof ScheduleError && e.code==='invalid_date')
-    await assert.rejects(readSchedule(db,employeeActor,{employeeId:employee,from:'2026-01-01',to:'2027-01-01'}),(e:unknown)=>e instanceof ScheduleError && e.code==='invalid_range')
+    const maxRange=await readSchedule(db,employeeActor,{employeeId:employee,from:'2026-01-01',to:'2027-01-01'})
+    assert.equal(maxRange.length,366) // Maximum includes both endpoints, so a non-leap full year is valid.
+    await assert.rejects(readSchedule(db,employeeActor,{employeeId:employee,from:'2026-01-01',to:'2027-01-02'}),(e:unknown)=>e instanceof ScheduleError && e.code==='invalid_range')
     // Calendar list follows the employee's site and effective shift for each holiday date.
     assert.equal((await listHolidays(db,employeeActor,{employeeId:employee,year:2026})).length,14) // Dec 25 falls under the new shift
     assert.equal((await listHolidays(db,employeeActor,{employeeId:employee,year:2025})).length,0)
@@ -110,10 +112,10 @@ test('2026 calendar, effective-dated shifts, scope, audit and leave use one sche
     await assignShift(db,hrActor,{employeeId:worker,siteId:site,shiftId:allOff.id,effectiveFrom:'2026-01-01',reason:'Test'})
     const workerActor=await resolveAuthenticatedSubject(db,subject(worker))
     assert.equal(await isWorkingDay(db,worker,next),false)
-    await assert.rejects(applyForPaidLeave(db,workerActor,{workDate:next}),(e:unknown)=>e instanceof LeaveError && e.code==='not_scheduled_work_date')
+    await assert.rejects(applyForPaidLeave(db,workerActor,{workDate:next,note:'Schedule integration test'}),(e:unknown)=>e instanceof LeaveError && e.code==='not_scheduled_work_date')
     await assignShift(db,hrActor,{employeeId:worker,siteId:site,shiftId:always.id,effectiveFrom:'2026-01-02',reason:'Test'})
     assert.equal(await isWorkingDay(db,worker,next),true)
-    await applyForPaidLeave(db,workerActor,{workDate:next})
+    await applyForPaidLeave(db,workerActor,{workDate:next,note:'Schedule integration test'})
     assert.equal((await db.query('SELECT 1 FROM leave_work_dates WHERE employee_id=$1 AND work_date=$2',[worker,next])).rows.length,1)
   } finally {
     await db.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(()=>{})

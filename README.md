@@ -2,6 +2,8 @@
 
 This slice connects a registered Android kiosk to a PostgreSQL punch ledger and the employee/HR receipt screen. Camera processing runs on the kiosk. The server authenticates the device, verifies a Google Play Integrity verdict and checks its live enrollment and site assignment. It commits the punch, audit row and notification outbox row together. WhatsApp delivery is a subsequent integration.
 
+For a GitHub-connected Vercel staging deployment with Supabase Auth, Postgres and scheduled WhatsApp delivery, follow the [deployment guide](DEPLOYMENT.md).
+
 ## Run the software checks
 
 Use Node 22.19 or newer and npm. From the repository root run `npm ci` and `npm run check`. The database tests start an isolated PostgreSQL instance on loopback. They do not require a running Docker daemon, corporate credentials or employee records. The cross-feature test exercises the production request handlers with generated signing keys, synthetic face scores and test-only responses from the external identity providers.

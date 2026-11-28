@@ -6,6 +6,8 @@ import test from 'node:test';
 import {
   AttendanceActionOrderError,
   AttendanceConflictError,
+  AttendanceOutTooSoonError,
+  MIN_SECONDS_BEFORE_OUT,
   digestPunchEvidence,
   findCommittedPunchRetry,
   getPunchReceipt,
@@ -93,11 +95,24 @@ test('attendance records, retries and serializes punches in an isolated PostgreS
       AttendanceConflictError,
     );
 
+    // False check-out guard: an OUT within MIN_SECONDS_BEFORE_OUT of the IN is refused.
+    await assert.rejects(
+      withTransaction(client => recordPunch(client, input(employeeId, 'OUT'))),
+      error => error instanceof AttendanceOutTooSoonError && error.lastRecordedAt === receipt.recordedAt
+        && error.retryAfterSeconds > 0 && error.retryAfterSeconds <= MIN_SECONDS_BEFORE_OUT,
+    );
+    // Simulate time passing by moving the check-in back past the guard.
+    await withTransaction(client => client.query(
+      `UPDATE attendance_punches SET recorded_at = recorded_at - make_interval(secs => $2) WHERE punch_id = $1`,
+      [receipt.punchId, MIN_SECONDS_BEFORE_OUT + 60]));
+    const inReceipt = await withTransaction(client => getPunchReceipt(client, receipt.punchId));
+    assert.ok(inReceipt);
+
     const second = input(employeeId, 'OUT');
     const secondReceipt = await withTransaction(client => recordPunch(client, second));
     await withTransaction(async client => {
-      assert.deepEqual(await getPunchReceipt(client, receipt.punchId), receipt);
-      assert.deepEqual(await listPunchReceipts(client, employeeId), [secondReceipt, receipt]);
+      assert.deepEqual(await getPunchReceipt(client, receipt.punchId), inReceipt);
+      assert.deepEqual(await listPunchReceipts(client, employeeId), [secondReceipt, inReceipt]);
       assert.deepEqual(await listPunchReceipts(client, employeeId, { limit: 1 }), [secondReceipt]);
       const counts = await client.query(
         `SELECT (SELECT count(*)::int FROM attendance_punches) AS punches,

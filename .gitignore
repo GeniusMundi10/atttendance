@@ -12,4 +12,5 @@ design-mockups/
 *.keystore
 dist/
 .next/
+.vercel/
 *.tsbuildinfo

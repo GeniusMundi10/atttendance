@@ -1,6 +1,6 @@
 // PURPOSE: Expose production kiosk commands and role-scoped, read-only portal receipts.
 import { AccessDeniedError, AccessMfaRequiredError, approveSignup, authorizeReceiptRead, listReadableEmployees, listSignupRequests, requestSignup, resolveAuthenticatedSubject } from '../features/access/access.ts'
-import { AttendanceActionOrderError, AttendanceConflictError, listPunchReceipts } from '../features/attendance/attendance.ts'
+import { AttendanceActionOrderError, AttendanceConflictError, AttendanceOutTooSoonError, listPunchReceipts } from '../features/attendance/attendance.ts'
 import { BiometricsError, approveFaceEnrollment, cancelFaceEnrollment, claimFaceEnrollment, completeFaceEnrollment, enrollFace, fetchRoster, getFaceEnrollmentSessionStatus, getFaceEnrollmentStatus, issueChallenge, issueFaceEnrollmentCode, listFaceEnrollmentQueue, requestFaceReregistration, resetFaceRegistration } from '../features/biometrics/server.ts'
 import { CorrectionError, listEffectiveDays } from '../features/corrections/corrections.ts'
 import { correctionsApi } from '../features/corrections/http.ts'
@@ -139,6 +139,7 @@ export async function api(request:Request, parts:string[]) {
     if (err instanceof AccessMfaRequiredError) return json({error:'mfa_required'},403)
     if (err instanceof AccessDeniedError) return json({error:'access_denied'},403)
     if (err instanceof AttendanceActionOrderError) return json({error:err.code,expectedAction:err.expectedAction,lastRecordedAt:err.lastRecordedAt},409)
+    if (err instanceof AttendanceOutTooSoonError) return json({error:err.code,lastRecordedAt:err.lastRecordedAt,waitSeconds:err.retryAfterSeconds},409)
     if (err instanceof AttendanceConflictError) return json({error:err.code},409)
     if (err instanceof CorrectionError) return json({error:err.code},err.status)
     if (err instanceof ScheduleError) return json({error:err.code},err.status)

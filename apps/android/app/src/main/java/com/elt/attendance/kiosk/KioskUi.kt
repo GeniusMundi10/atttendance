@@ -29,6 +29,8 @@ internal object Palette {
     val greenDot = Color.rgb(74, 210, 120)
     val greenSoft = Color.rgb(226, 245, 233)
     val greenGuide = Color.rgb(52, 211, 110)
+    /** Punch scan in progress: calm "working" colour, so people don't read it as an error and re-adjust. */
+    val scanYellow = Color.rgb(255, 204, 0)
     val peachTop = Color.rgb(252, 214, 199)
     val peachBottom = Color.rgb(255, 247, 243)
 }

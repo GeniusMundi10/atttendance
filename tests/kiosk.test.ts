@@ -123,5 +123,13 @@ test('signed kiosk punch is committed once and readable only within the employee
   assert.deepEqual((await ok(await view(ids.hr,'aal2'))).punches,[receipt])
   assert.equal((await view(ids.other)).status,403)
   assert.equal((await view(undefined)).status,401)
+  // False check-out guard: an immediate OUT is refused with when the IN was recorded and how long to wait.
+  const tooSoon=await rawPost('punches',await makePunch('OUT'))
+  assert.equal(tooSoon.status,409)
+  const tooSoonBody=await tooSoon.json()
+  assert.equal(tooSoonBody.error,'ATTENDANCE_OUT_TOO_SOON')
+  assert.equal(tooSoonBody.lastRecordedAt,receipt.recordedAt)
+  assert.ok(tooSoonBody.waitSeconds>0)
+  await pool.query("UPDATE attendance_punches SET recorded_at = recorded_at - interval '3 minutes' WHERE punch_id = $1",[receipt.punchId])
   assert.equal((await ok(await rawPost('punches',await makePunch('OUT')))).action,'OUT')
 })

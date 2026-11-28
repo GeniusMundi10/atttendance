@@ -4,6 +4,7 @@ export default {
   poweredByHeader: false,
   devIndicators: false,
   turbopack: {root: fileURLToPath(new URL('../../', import.meta.url))},
+  outputFileTracingRoot: fileURLToPath(new URL('../../', import.meta.url)),
   serverExternalPackages: ['pg'],
   // Dev only: let phones reach `next dev` through an ngrok tunnel.
   allowedDevOrigins: ['*.ngrok-free.dev', '*.ngrok-free.app']

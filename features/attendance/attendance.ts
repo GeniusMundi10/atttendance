@@ -50,6 +50,23 @@ export class AttendanceActionOrderError extends Error {
   }
 }
 
+/** A check-out this soon after check-in is treated as a false punch (someone walking past the kiosk again). */
+export const MIN_SECONDS_BEFORE_OUT = 120;
+
+export class AttendanceOutTooSoonError extends Error {
+  readonly code = 'ATTENDANCE_OUT_TOO_SOON';
+  /** When the employee checked in, and how long until check-out is allowed. */
+  readonly lastRecordedAt: string;
+  readonly retryAfterSeconds: number;
+
+  constructor(lastRecordedAt: string, retryAfterSeconds: number) {
+    super('Check-out too soon after check-in');
+    this.name = 'AttendanceOutTooSoonError';
+    this.lastRecordedAt = lastRecordedAt;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DIGEST = /^[0-9a-f]{64}$/;
 
@@ -140,13 +157,21 @@ export async function recordPunch(client: AttendanceTransaction, input: RecordPu
   // Requests lock first; employees lock second. Distinct requests for one employee therefore serialize.
   await client.query("SELECT pg_advisory_xact_lock(hashtextextended('attendance:employee:' || $1, 0))", [input.employeeId]);
   const latest = await client.query(
-    `SELECT action, to_char(recorded_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS recorded_at
+    `SELECT action, to_char(recorded_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS recorded_at,
+            EXTRACT(EPOCH FROM clock_timestamp() - recorded_at) AS age_seconds
        FROM attendance_punches WHERE employee_id = $1 ORDER BY sequence DESC LIMIT 1`,
     [input.employeeId],
   );
   const lastAction = latest.rows[0]?.action;
   const expectedAction: PunchAction = lastAction === 'IN' ? 'OUT' : 'IN';
   if (input.action !== expectedAction) throw new AttendanceActionOrderError(expectedAction, latest.rows[0] ? String(latest.rows[0].recorded_at) : null);
+  // Guard against false check-outs: same clock as recorded_at's default, so device time cannot shift it.
+  if (input.action === 'OUT') {
+    const age = Number(latest.rows[0]!.age_seconds);
+    if (age < MIN_SECONDS_BEFORE_OUT) {
+      throw new AttendanceOutTooSoonError(String(latest.rows[0]!.recorded_at), Math.ceil(MIN_SECONDS_BEFORE_OUT - age));
+    }
+  }
 
   const inserted = await client.query(
     `INSERT INTO attendance_punches

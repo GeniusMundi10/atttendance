@@ -136,7 +136,16 @@ internal data class EnrollmentStatus(
     val siteName: String?,
     val completedAt: Instant?,
 )
-internal class ApiRejected(val code: String, val waitSeconds: Int? = null, val registeredName: String? = null, val lastPunchAt: Instant? = null) : IOException("Kiosk request rejected")
+internal class ApiRejected(
+    val code: String,
+    val waitSeconds: Int? = null,
+    val registeredName: String? = null,
+    val lastRecordedAt: LastRecordedAt = LastRecordedAt.Missing,
+    val expectedAction: Action? = null,
+) : IOException("Kiosk request rejected") {
+    // Kept for existing display code; typed consumers should distinguish missing from explicit null.
+    val lastPunchAt: Instant? get() = (lastRecordedAt as? LastRecordedAt.Timestamp)?.instant
+}
 
 internal class KioskApi(private val config: KioskConfig, private val signer: DeviceSigner, private val play: PlayProof) {
     private var cachedRoster: List<Template> = emptyList()
@@ -310,8 +319,9 @@ internal class KioskApi(private val config: KioskConfig, private val signer: Dev
                 if (code != null && code.matches(Regex("[A-Za-z][A-Za-z0-9_]{2,80}"))) {
                     val wait = errorObject?.optInt("waitSeconds")?.takeIf { it > 0 }
                     val registered = errorObject?.optString("registeredName")?.takeIf { it.isNotBlank() }?.take(60)
-                    val lastPunchAt = errorObject?.optString("lastRecordedAt")?.let { runCatching { Instant.parse(it) }.getOrNull() }
-                    throw ApiRejected(code, wait, registered, lastPunchAt)
+                    val lastRecordedAt = errorObject?.let(PunchVoice::decodeLastRecordedAt) ?: LastRecordedAt.Missing
+                    val expectedAction = errorObject?.let(PunchVoice::decodeExpectedAction)
+                    throw ApiRejected(code, wait, registered, lastRecordedAt, expectedAction)
                 }
                 throw IOException("Kiosk server response was incomplete")
             }
