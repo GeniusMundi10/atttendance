@@ -15,6 +15,9 @@ internal sealed interface CapturePurpose {
 }
 internal data class CaptureResult(val frames: JSONArray, val template: Template?, val embedding: JSONArray?)
 
+/** Live samples one capture needs; the kiosk shows punch progress as a share of this. */
+internal const val PUNCH_SAMPLES = 3
+
 internal class FaceCapture(val purpose: CapturePurpose, private val onSampleAccepted: (Int) -> Unit = {}) {
     private val started = SystemClock.elapsedRealtimeNanos()
     private val frames = mutableListOf<JSONArray>()
@@ -60,7 +63,7 @@ internal class FaceCapture(val purpose: CapturePurpose, private val onSampleAcce
         frames += JSONArray(listOf(elapsed.toInt(), sample.liveness, score, margin))
         samples += sample.embedding
         onSampleAccepted(frames.size)
-        if (frames.size < 3) return null
+        if (frames.size < PUNCH_SAMPLES) return null
         val poses = (purpose as? CapturePurpose.SelfServiceEnrollment)?.poses.orEmpty()
         // The angle sweep is unverified for liveness, so it must be the same person as the live frames.
         if (poses.any { similarity(it, samples.first()) < PoseSweep.SAME_PERSON }) {

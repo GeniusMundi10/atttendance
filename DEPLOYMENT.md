@@ -82,5 +82,5 @@ To pause notification delivery, run `SELECT cron.unschedule('elt-whatsapp-outbox
 - Run the physical acceptance in `README.md` on the mounted kiosk (lighting, photo/screen spoof attempts, latency) and calibrate the match thresholds; the duplicate-face check uses the same 0.50 score as a punch.
 - Get the WhatsApp message template approved by Meta.
 - New sign-ups are assigned to the first active site by name. Add a site picker to the approval step before a second site goes live.
-- The automatic IN-before-noon / OUT-from-4pm rule is one company-wide setting in `apps/android/.../PunchWindow.kt`.
+- The automatic IN-before-noon rule (check-out is always a tap) is one company-wide setting in `apps/android/.../PunchWindow.kt`.
 - The full `npm run check` passed, including feature, integration, portal checks and the production build. Run it again for each release candidate; Vercel, Supabase, Play Console, Meta configuration, and hosted acceptance still require the operator steps above.

@@ -178,7 +178,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               <button type="button" onClick={signOut}><Icon name="logout" size={20} />Sign out</button>
             </div>
           </details>
-          <Link href="/" className="wordmark" aria-label="ELT HRMS home">ELT <span>HRMS</span></Link>
+          <Link href="/" className="wordmark" aria-label="Hr Flow home">Hr <span>Flow</span></Link>
         </header>
         {children}
       </main>
